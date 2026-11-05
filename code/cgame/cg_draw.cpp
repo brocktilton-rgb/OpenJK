@@ -27,6 +27,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #include "cg_headers.h"
 
 #include "cg_media.h"
+#include "cg_bridge.h"
 #include "../game/objectives.h"
 #include "../game/g_vehicles.h"
 
@@ -4237,6 +4238,11 @@ void CG_DrawActive( stereoFrame_t stereoView ) {
 		CG_DrawInformation();
 		return;
 	}
+
+	// Camera, FOV, and the player pose are final here, including cinematics
+	// and emplaced guns. Stereo eye offset is applied below, so the packet
+	// is the center camera this frame is about to draw. See docs/BRIDGE.md.
+	Bridge_Frame( stereoView );
 
 	//FIXME: these globals done once at start of frame for various funcs
 	AngleVectors (cg.refdefViewAngles, vfwd, vright, vup);

@@ -23,6 +23,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 
 #include "cg_media.h"
 #include "FxScheduler.h"
+#include "cg_bridge.h"
 
 #include "../client/vmachine.h"
 #include "g_local.h"
@@ -2091,6 +2092,7 @@ void CG_PreInit() {
 	iCGResetCount = 0;
 
 	CG_RegisterCvars();
+	Bridge_Init();
 
 //moved from CG_GameStateReceived because it's loaded sooner now
 	CG_InitLocalEntities();
@@ -2183,6 +2185,7 @@ Called before every level change or subsystem restart
 */
 void CG_Shutdown( void )
 {
+	Bridge_Shutdown();
 	in_camera = false;
 	FX_Free();
 }
