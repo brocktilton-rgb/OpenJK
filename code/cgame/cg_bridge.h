@@ -30,11 +30,22 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #define BRIDGE_VERSION				1
 #define BRIDGE_PACKET_POSE			1
 #define BRIDGE_PACKET_MAP			2
+#define BRIDGE_PACKET_SABER			3
 
 // Common header is 20 bytes. Sizes include that header.
+// Type 1 and type 2 layouts are frozen. New packets use a new type.
 #define BRIDGE_POSE_PACKET_SIZE		160
 #define BRIDGE_MAP_PACKET_SIZE		84
 #define BRIDGE_MAP_NAME_LEN			64
+
+// Type 3: two hilt names plus 16 fixed blade slots (MAX_SABERS * MAX_BLADES).
+#define BRIDGE_HILT_NAME_LEN		64
+#define BRIDGE_SABER_BLADE_SLOTS	16
+#define BRIDGE_SABER_BLADE_BYTES	32
+#define BRIDGE_SABER_PACKET_SIZE	672
+
+#define BRIDGE_SABER_DUAL			0x01u
+#define BRIDGE_SABER_IN_FLIGHT		0x02u
 
 #define BRIDGE_DEFAULT_PORT			"27420"
 

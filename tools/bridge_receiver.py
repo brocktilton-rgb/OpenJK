@@ -21,9 +21,21 @@ MAGIC = b"OJB1"
 VERSION = 1
 PACKET_POSE = 1
 PACKET_MAP = 2
+PACKET_SABER = 3
 POSE_SIZE = 160
 MAP_SIZE = 84
+SABER_SIZE = 672
 MAP_NAME_LEN = 64
+HILT_NAME_LEN = 64
+SABER_BLADE_SLOTS = 16
+SABER_BLADE_BYTES = 32
+SABER_FLAG_DUAL = 0x01
+SABER_FLAG_IN_FLIGHT = 0x02
+SABER_COLORS = ("red", "orange", "yellow", "green", "blue", "purple")
+SABER_TYPES = (
+    "none", "single", "staff", "dagger", "broad", "prong", "arc",
+    "sai", "claw", "lance", "star", "trident", "sith_sword",
+)
 
 FLAG_THIRDPERSON = 0x00000001
 FLAG_CINEMATIC = 0x00000002
@@ -108,7 +120,38 @@ def decode_packet(buf: bytes) -> dict:
         raw = buf[20:20 + MAP_NAME_LEN]
         header["map_name"] = raw.split(b"\x00", 1)[0].decode("ascii", "replace")
         return header
-    raise PacketError("unknown packet type %d" % kind)
+    if kind == PACKET_SABER:
+        if len(buf) < SABER_SIZE:
+            raise PacketError("short saber packet (%d < %d)" % (len(buf), SABER_SIZE))
+        header["blade_count"] = _u16(buf, 20)
+        header["saber_count"] = buf[22]
+        header["saber_flags"] = buf[23]
+        header["hilt0"] = buf[24:24 + HILT_NAME_LEN].split(b"\x00", 1)[0].decode("ascii", "replace")
+        header["saber_type0"] = _i32(buf, 88)
+        header["hilt1"] = buf[92:92 + HILT_NAME_LEN].split(b"\x00", 1)[0].decode("ascii", "replace")
+        header["saber_type1"] = _i32(buf, 156)
+        blades = []
+        base = 160
+        count = header["blade_count"]
+        if count > SABER_BLADE_SLOTS:
+            count = SABER_BLADE_SLOTS
+        for index in range(count):
+            off = base + index * SABER_BLADE_BYTES
+            blades.append({
+                "saber_index": buf[off],
+                "blade_index": buf[off + 1],
+                "active": buf[off + 2],
+                "color_index": buf[off + 3],
+                "length": _f32(buf, off + 4),
+                "base": _vec3(buf, off + 8),
+                "tip": _vec3(buf, off + 20),
+            })
+        header["blades"] = blades
+        return header
+    # One datagram is one packet. Unknown types are ignored so older readers
+    # of type 1 and type 2 keep working when new types show up.
+    header["skipped"] = True
+    return header
 
 
 def _fmt_vec(value: tuple[float, float, float]) -> str:
@@ -132,7 +175,64 @@ def _flag_names(flags: int) -> str:
     return ",".join(names)
 
 
+def _saber_color(index: int) -> str:
+    if 0 <= index < len(SABER_COLORS):
+        return SABER_COLORS[index]
+    return "color%d" % index
+
+
+def _saber_type(index: int) -> str:
+    if 0 <= index < len(SABER_TYPES):
+        return SABER_TYPES[index]
+    return "type%d" % index
+
+
+def _saber_flag_names(flags: int) -> str:
+    names = []
+    if flags & SABER_FLAG_DUAL:
+        names.append("dual")
+    if flags & SABER_FLAG_IN_FLIGHT:
+        names.append("inflight")
+    if not names:
+        return "-"
+    return ",".join(names)
+
+
 def format_packet(packet: dict, verbose: bool) -> str:
+    if packet.get("skipped"):
+        return "skip type=%d seq=%d frame=%d" % (packet["type"], packet["sequence"], packet["frame"])
+    if packet["type"] == PACKET_SABER:
+        lines = [
+            "saber seq=%d frame=%d t=%d blades=%d sabers=%d flags=0x%x(%s) hilt0=%s(%s) hilt1=%s(%s)"
+            % (
+                packet["sequence"],
+                packet["frame"],
+                packet["server_time"],
+                packet["blade_count"],
+                packet["saber_count"],
+                packet["saber_flags"],
+                _saber_flag_names(packet["saber_flags"]),
+                packet["hilt0"] or '""',
+                _saber_type(packet["saber_type0"]),
+                packet["hilt1"] or '""',
+                _saber_type(packet["saber_type1"]),
+            )
+        ]
+        for blade in packet["blades"]:
+            lines.append(
+                "  blade s%d.b%d %s color=%d(%s) len=%.2f base=%s tip=%s"
+                % (
+                    blade["saber_index"],
+                    blade["blade_index"],
+                    "on" if blade["active"] else "off",
+                    blade["color_index"],
+                    _saber_color(blade["color_index"]),
+                    blade["length"],
+                    _fmt_vec(blade["base"]),
+                    _fmt_vec(blade["tip"]),
+                )
+            )
+        return "\n".join(lines)
     if packet["type"] == PACKET_MAP:
         return "map  seq=%d frame=%d t=%d name=%s" % (
             packet["sequence"], packet["frame"], packet["server_time"], packet["map_name"] or '""'
@@ -242,6 +342,29 @@ def _pack_map() -> bytes:
     return payload
 
 
+def _pack_saber() -> bytes:
+    buf = bytearray(SABER_SIZE)
+    struct.pack_into("<4sHHIIi", buf, 0, MAGIC, VERSION, PACKET_SABER, 9, 42, 1500)
+    struct.pack_into("<HBB", buf, 20, 2, 1, 0)
+    buf[24:28] = b"Kyle"
+    struct.pack_into("<i", buf, 88, 2)  # staff
+    struct.pack_into(
+        "<BBBBf3f3f", buf, 160,
+        0, 0, 1, 4, 32.0,
+        1.0, 2.0, 3.0,
+        33.0, 2.0, 3.0,
+    )
+    struct.pack_into(
+        "<BBBBf3f3f", buf, 160 + SABER_BLADE_BYTES,
+        0, 1, 0, 4, 0.0,
+        1.0, 2.0, 40.0,
+        1.0, 2.0, 40.0,
+    )
+    if len(buf) != SABER_SIZE:
+        raise AssertionError("saber pack size %d" % len(buf))
+    return bytes(buf)
+
+
 def self_test() -> int:
     pose = decode_packet(_pack_pose())
     assert pose["sequence"] == 7
@@ -266,6 +389,23 @@ def self_test() -> int:
     assert map_packet["map_name"] == "maps/kejim_post.bsp"
     assert map_packet["sequence"] == 8
 
+    saber = decode_packet(_pack_saber())
+    assert saber["sequence"] == 9
+    assert saber["blade_count"] == 2 and saber["saber_count"] == 1
+    assert saber["hilt0"] == "Kyle" and saber["saber_type0"] == 2
+    assert saber["hilt1"] == "" and saber["saber_type1"] == 0
+    assert saber["blades"][0]["active"] == 1 and saber["blades"][0]["color_index"] == 4
+    assert saber["blades"][0]["length"] == 32.0
+    assert saber["blades"][0]["base"] == (1.0, 2.0, 3.0)
+    assert saber["blades"][0]["tip"] == (33.0, 2.0, 3.0)
+    assert saber["blades"][1]["active"] == 0 and saber["blades"][1]["blade_index"] == 1
+    # Type 1 and type 2 still decode after a type 3 packet, and unknown types are skipped.
+    assert decode_packet(_pack_pose())["type"] == PACKET_POSE
+    unknown = bytearray(24)
+    struct.pack_into("<4sHHIIi", unknown, 0, MAGIC, VERSION, 99, 10, 1, 0)
+    skipped = decode_packet(bytes(unknown))
+    assert skipped.get("skipped") and skipped["type"] == 99
+
     try:
         decode_packet(b"NOPE" + b"\x00" * 20)
         raise AssertionError("bad magic was accepted")
@@ -277,20 +417,23 @@ def self_test() -> int:
         sock.bind(("127.0.0.1", 0))
         sock.settimeout(2.0)
         dest = sock.getsockname()
-        for payload in (_pack_map(), _pack_pose()):
+        for payload in (_pack_map(), _pack_pose(), _pack_saber()):
             sent = sock.sendto(payload, dest)
             if sent != len(payload):
                 raise AssertionError("short UDP send")
             data, _addr = sock.recvfrom(2048)
             decoded = decode_packet(data)
-            if payload[6:8] == struct.pack("<H", PACKET_MAP):
+            kind = struct.unpack_from("<H", payload, 6)[0]
+            if kind == PACKET_MAP:
                 assert decoded["map_name"] == "maps/kejim_post.bsp"
-            else:
+            elif kind == PACKET_POSE:
                 assert decoded["cam_origin"] == (10.0, 20.0, 30.0)
+            else:
+                assert decoded["hilt0"] == "Kyle" and len(decoded["blades"]) == 2
     finally:
         sock.close()
 
-    print("bridge_receiver self-test ok (pose %d bytes, map %d bytes)" % (POSE_SIZE, MAP_SIZE))
+    print("bridge_receiver self-test ok (pose %d bytes, map %d bytes, saber %d bytes)" % (POSE_SIZE, MAP_SIZE, SABER_SIZE))
     return 0
 
 
@@ -304,8 +447,8 @@ def listen(host: str, port: int, verbose: bool, summary: bool) -> int:
         return 1
 
     print(
-        "OpenJK bridge receiver listening on %s:%d (pose %d bytes, map %d bytes, version %d)"
-        % (host, port, POSE_SIZE, MAP_SIZE, VERSION),
+        "OpenJK bridge receiver listening on %s:%d (pose %d, map %d, saber %d bytes, version %d)"
+        % (host, port, POSE_SIZE, MAP_SIZE, SABER_SIZE, VERSION),
         flush=True,
     )
     print("Ctrl+C to stop. Start a level in OpenJK; the main menu does not send poses.", flush=True)
@@ -317,6 +460,8 @@ def listen(host: str, port: int, verbose: bool, summary: bool) -> int:
     bad = 0
     poses = 0
     maps = 0
+    sabers = 0
+    skipped = 0
     last_pose = None
 
     try:
@@ -336,11 +481,15 @@ def listen(host: str, port: int, verbose: bool, summary: bool) -> int:
 
             if packet is not None:
                 missed = tracker.note(packet["sequence"])
-                if packet["type"] == PACKET_POSE:
+                if packet.get("skipped"):
+                    skipped += 1
+                elif packet["type"] == PACKET_POSE:
                     poses += 1
                     last_pose = packet
                 elif packet["type"] == PACKET_MAP:
                     maps += 1
+                elif packet["type"] == PACKET_SABER:
+                    sabers += 1
                 if not summary:
                     suffix = "" if missed == 0 else "  gap=%d" % missed
                     print(format_packet(packet, verbose) + suffix, flush=True)
@@ -352,8 +501,8 @@ def listen(host: str, port: int, verbose: bool, summary: bool) -> int:
             if elapsed >= 1.0:
                 rate = window_count / elapsed
                 print(
-                    "rate %.1f pkt/s  window=%d total=%d pose=%d map=%d bad=%d seq_gaps=%d"
-                    % (rate, window_count, total, poses, maps, bad, tracker.gaps),
+                    "rate %.1f pkt/s  window=%d total=%d pose=%d map=%d saber=%d skip=%d bad=%d seq_gaps=%d"
+                    % (rate, window_count, total, poses, maps, sabers, skipped, bad, tracker.gaps),
                     flush=True,
                 )
                 if summary and last_pose is not None:
@@ -361,7 +510,7 @@ def listen(host: str, port: int, verbose: bool, summary: bool) -> int:
                 window_start = now
                 window_count = 0
     except KeyboardInterrupt:
-        print("\nstopped. total=%d pose=%d map=%d bad=%d seq_gaps=%d" % (total, poses, maps, bad, tracker.gaps))
+        print("\nstopped. total=%d pose=%d map=%d saber=%d skip=%d bad=%d seq_gaps=%d" % (total, poses, maps, sabers, skipped, bad, tracker.gaps))
         return 0
     finally:
         sock.close()

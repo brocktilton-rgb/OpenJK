@@ -32,7 +32,7 @@ All four are archived. The default is off.
 | `bridge_enable` | `0` | `1` streams. `0` closes the socket. |
 | `bridge_host` | `127.0.0.1` | Numeric IPv4 only. Hostnames are rejected so the game cannot block in DNS. |
 | `bridge_port` | `27420` | UDP destination port. |
-| `bridge_rate` | `0` | Maximum pose packets per second, using client realtime. `0` sends every rendered frame. Clamped to 480. The interval is `1000 / rate` milliseconds. |
+| `bridge_rate` | `0` | Maximum samples per second, using client realtime. `0` sends every rendered frame. Clamped to 480. The interval is `1000 / rate` milliseconds. A sample is the map packet (when one is due), the pose packet, and the saber packet when a lightsaber is out. |
 
 Changing host or port reopens the socket on the next frame. A rejected host stops the stream until the value is a numeric IPv4 address again.
 
@@ -57,7 +57,9 @@ World space is id Tech 3 / Jedi Academy: **+X forward, +Y left, +Z up**, in game
 2. right (`viewaxis[1]`, which is `(0, -1, 0)` at the identity view, because +Y is left)
 3. up (`viewaxis[2]`)
 
-`serverTime` is `cg.time` in milliseconds (pauses and timescale affect it). `frame` is `cg.clientFrame`. `sequence` increments by one for every datagram the game attempts to send, map and pose included, and resets to 1 on shutdown. A gap in `sequence` is a dropped datagram. A gap in `frame` while `sequence` stays contiguous is the rate limit (or a skipped stereo eye).
+`serverTime` is `cg.time` in milliseconds (pauses and timescale affect it). `frame` is `cg.clientFrame`. `sequence` increments by one for every datagram the game attempts to send (map, pose, and saber), and resets to 1 on shutdown. A gap in `sequence` is a dropped datagram. A gap in `frame` while `sequence` stays contiguous is the rate limit (or a skipped stereo eye).
+
+Each datagram is one packet. Readers that only know type 1 and type 2 drop any other type. Those two layouts are unchanged, so an older `OJB1` reader keeps working. Type 3 is an additional datagram, not a change to the pose packet.
 
 ### Common header
 
@@ -65,7 +67,7 @@ World space is id Tech 3 / Jedi Academy: **+X forward, +Y left, +Z up**, in game
 | ---: | ---: | --- | --- |
 | 0 | 4 | char[4] | magic `OJB1` |
 | 4 | 2 | uint16 | version = 1 |
-| 6 | 2 | uint16 | type: `1` pose, `2` map |
+| 6 | 2 | uint16 | type: `1` pose, `2` map, `3` saber |
 | 8 | 4 | uint32 | sequence |
 | 12 | 4 | uint32 | frame (`cg.clientFrame`) |
 | 16 | 4 | int32 | serverTime (`cg.time`, ms) |
@@ -123,6 +125,51 @@ Sent when the map name changes, and again at most once every two seconds so a li
 
 The name is `cgs.mapname`, for example `maps/kejim_post.bsp`.
 
+### Saber packet (type 3, 672 bytes)
+
+Sent on the same sample as the pose packet, under the same `bridge_rate` cap, while the live player weapon is `WP_SABER` or `saberInFlight` is set. A blaster or other weapon produces no type 3 datagram that frame, which means the lightsaber is not out. Ignition and shutdown still send the packet: each blade has its own active flag and a length that eases in and out.
+
+The data is the single-player `playerState_t::saber[2]` (`saberInfo_t`). Blade positions are the world-space segment cgame stored while drawing the blade earlier in the frame (`CG_AddSaberBladeGo` for an in-hand saber, or the thrown saber entity). Same coordinates as the pose packet: **+X forward, +Y left, +Z up**, game units.
+
+`hiltName` is `saberInfo_t::name`, the `sabers.cfg` key (for example `Kyle`), not the UI `fullName`. It is a stable id for the hilt. 64 bytes, NUL-terminated, truncated, and all zeros if the pointer is null. Saber 1's name is empty unless `dualSabers` is set.
+
+`saberType` is `saberType_t`: `0` none, `1` single, `2` staff, `3` dagger, `4` broad, `5` prong, `6` arc, `7` sai, `8` claw, `9` lance, `10` star, `11` trident, `12` sith sword. A staff is one saber (`saber[0]`) with two blades. Dual sabers set `saberCount` to 2 and the dual flag.
+
+There are always 16 blade slots (`MAX_SABERS * MAX_BLADES`). `bladeCount` is how many of those slots are filled, in order: every blade of saber 0, then every blade of saber 1. Slots at or past `bladeCount` are zero and must be ignored (a zero `colorIndex` would otherwise look like red). Each filled slot is 32 bytes:
+
+| Offset | Size | Type | Field |
+| ---: | ---: | --- | --- |
+| 0 | 1 | uint8 | `saberIndex` (0 or 1) |
+| 1 | 1 | uint8 | `bladeIndex` within that saber |
+| 2 | 1 | uint8 | active (`bladeInfo_t::active`, 0 off, 1 on) |
+| 3 | 1 | uint8 | `colorIndex` (`saber_colors_t`) |
+| 4 | 4 | float | length, game units (`bladeInfo_t::length`) |
+| 8 | 12 | float[3] | base, world (`muzzlePoint`) |
+| 20 | 12 | float[3] | tip, world (`muzzlePoint + muzzleDir * length`) |
+
+`colorIndex`: `0` red, `1` orange, `2` yellow, `3` green, `4` blue, `5` purple.
+
+If a blade's length is 0, cgame may not refresh the muzzle that frame, so base and tip can be zero or a previous point. The active flag and length are still the gameplay state.
+
+| Offset | Size | Type | Field |
+| ---: | ---: | --- | --- |
+| 0 | 20 | header | type = 3 |
+| 20 | 2 | uint16 | `bladeCount` (0..16) |
+| 22 | 1 | uint8 | `saberCount` (1, or 2 when dual) |
+| 23 | 1 | uint8 | flags |
+| 24 | 64 | char[64] | hilt name 0 |
+| 88 | 4 | int32 | saber type 0 |
+| 92 | 64 | char[64] | hilt name 1 |
+| 156 | 4 | int32 | saber type 1 |
+| 160 | 512 | 16 × 32 | blade slots |
+
+Saber flags:
+
+| Bit | Mask | Meaning |
+| ---: | --- | --- |
+| 0 | `0x01` | `dualSabers` |
+| 1 | `0x02` | `saberInFlight` (thrown; saber 0's blade follows the saber entity) |
+
 ## Test on Windows with retail GameData
 
 Use the 64-bit Release Non-Portable artifact from this pull request's GitHub Actions run. The job name is **Windows x86_64 Release (Non-Portable)**. The artifact name is **`OpenJK-windows-x86_64-Release-Non-Portable`**. Non-Portable uses the same `Documents\My Games\OpenJK` config and saves as the official build. A 32-bit retail install wants `OpenJK-windows-x86-Release-Non-Portable` instead (`openjk_sp.x86.exe`, `rdsp-vanilla_x86.dll`, `OpenJK\jagamex86.dll`).
@@ -154,7 +201,7 @@ Use the 64-bit Release Non-Portable artifact from this pull request's GitHub Act
    openjk_sp.x86_64.exe +set bridge_enable 1 +set bridge_host 127.0.0.1 +set bridge_port 27420 +set bridge_rate 30
    ```
 
-6. Start a new game or load a save. The console prints `Bridge: UDP pose stream -> 127.0.0.1:27420` when the first gameplay frame is drawn. The receiver prints `map` lines (`maps/<level>.bsp`) and `pose` lines, plus a `rate ... pkt/s` line every second.
+6. Start a new game or load a save. The console prints `Bridge: UDP pose stream -> 127.0.0.1:27420` when the first gameplay frame is drawn. The receiver prints `map` lines (`maps/<level>.bsp`) and `pose` lines, plus a `rate ... pkt/s` line every second. With the lightsaber equipped it also prints a `saber` line (hilt name, per-blade on/off, color, length, base, and tip) on the same frames.
 7. Stop streaming with `set bridge_enable 0` in the console, or quit. Quitting and level changes close the socket.
 
 Localhost UDP usually does not raise a firewall prompt. If Windows asks, allow it for private networks, or keep both sides on `127.0.0.1`.

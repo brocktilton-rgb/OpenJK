@@ -273,6 +273,133 @@ static void Bridge_SendPose( uint32_t frame, int serverTime )
 	Bridge_Send( packet, BRIDGE_POSE_PACKET_SIZE );
 }
 
+static uint8_t *Bridge_WriteU8( uint8_t *p, unsigned int value )
+{
+	p[0] = (uint8_t)( value & 0xffu );
+	return p + 1;
+}
+
+static void Bridge_WriteHiltName( uint8_t *dst, const char *name )
+{
+	memset( dst, 0, BRIDGE_HILT_NAME_LEN );
+	if ( name && name[0] ) {
+		Q_strncpyz( (char *)dst, name, BRIDGE_HILT_NAME_LEN );
+	}
+}
+
+static int Bridge_ClampBladeCount( int numBlades )
+{
+	if ( numBlades < 0 ) {
+		return 0;
+	}
+	if ( numBlades > MAX_BLADES ) {
+		return MAX_BLADES;
+	}
+	return numBlades;
+}
+
+// tip = muzzlePoint + muzzleDir * length, the segment cgame already used to draw the blade.
+static uint8_t *Bridge_WriteBlade( uint8_t *p, int saberIndex, int bladeIndex, const bladeInfo_t *blade )
+{
+	vec3_t tip;
+
+	p = Bridge_WriteU8( p, (unsigned int)saberIndex );
+	p = Bridge_WriteU8( p, (unsigned int)bladeIndex );
+	p = Bridge_WriteU8( p, blade->active ? 1u : 0u );
+	p = Bridge_WriteU8( p, (unsigned int)blade->color );
+	p = Bridge_WriteF32( p, blade->length );
+	p = Bridge_WriteVec3( p, blade->muzzlePoint );
+	VectorMA( blade->muzzlePoint, blade->length, blade->muzzleDir, tip );
+	p = Bridge_WriteVec3( p, tip );
+	return p;
+}
+
+// Sent on the same ticks as the pose packet, only while a lightsaber is the
+// equipped weapon or is in flight. Pose and map bytes are not touched.
+static void Bridge_MaybeSendSaber( const playerState_t *ps, const centity_t *cent, uint32_t frame, int serverTime )
+{
+	const playerState_t *saberPs;
+	uint8_t packet[BRIDGE_SABER_PACKET_SIZE];
+	uint8_t *p;
+	uint8_t *bladeOut;
+	int saberSlots;
+	int saberIndex;
+	int bladeCount;
+	int slot;
+	unsigned int flags;
+
+	static_assert( BRIDGE_SABER_PACKET_SIZE == 672, "saber packet size drifted" );
+	static_assert( BRIDGE_SABER_BLADE_BYTES * BRIDGE_SABER_BLADE_SLOTS == 512, "saber blade table drifted" );
+
+	saberPs = ps;
+	if ( cent && cent->gent && cent->gent->client ) {
+		saberPs = &cent->gent->client->ps;
+	}
+	if ( !saberPs ) {
+		return;
+	}
+	if ( saberPs->weapon != WP_SABER && !saberPs->saberInFlight ) {
+		return;
+	}
+
+	memset( packet, 0, sizeof( packet ) );
+	p = Bridge_WriteHeader( packet, BRIDGE_PACKET_SABER, s_sequence++, frame, serverTime );
+
+	saberSlots = saberPs->dualSabers ? 2 : 1;
+	flags = 0;
+	if ( saberPs->dualSabers ) {
+		flags |= BRIDGE_SABER_DUAL;
+	}
+	if ( saberPs->saberInFlight ) {
+		flags |= BRIDGE_SABER_IN_FLIGHT;
+	}
+
+	bladeCount = 0;
+	for ( saberIndex = 0; saberIndex < saberSlots; ++saberIndex ) {
+		bladeCount += Bridge_ClampBladeCount( saberPs->saber[saberIndex].numBlades );
+	}
+	if ( bladeCount > BRIDGE_SABER_BLADE_SLOTS ) {
+		bladeCount = BRIDGE_SABER_BLADE_SLOTS;
+	}
+
+	p = Bridge_WriteU16( p, (unsigned int)bladeCount );
+	p = Bridge_WriteU8( p, (unsigned int)saberSlots );
+	p = Bridge_WriteU8( p, flags );
+	Bridge_WriteHiltName( p, saberPs->saber[0].name );
+	p += BRIDGE_HILT_NAME_LEN;
+	p = Bridge_WriteI32( p, (int)saberPs->saber[0].type );
+	if ( saberSlots > 1 ) {
+		Bridge_WriteHiltName( p, saberPs->saber[1].name );
+		p += BRIDGE_HILT_NAME_LEN;
+		p = Bridge_WriteI32( p, (int)saberPs->saber[1].type );
+	} else {
+		p += BRIDGE_HILT_NAME_LEN;
+		p = Bridge_WriteI32( p, 0 );
+	}
+
+	bladeOut = p;
+	slot = 0;
+	for ( saberIndex = 0; saberIndex < saberSlots && slot < bladeCount; ++saberIndex ) {
+		int blades = Bridge_ClampBladeCount( saberPs->saber[saberIndex].numBlades );
+		int bladeIndex;
+
+		for ( bladeIndex = 0; bladeIndex < blades && slot < bladeCount; ++bladeIndex, ++slot ) {
+			bladeOut = Bridge_WriteBlade( bladeOut, saberIndex, bladeIndex, &saberPs->saber[saberIndex].blade[bladeIndex] );
+		}
+	}
+
+	if ( (int)( p - packet ) != 160 || slot != bladeCount ) {
+		Bridge_Complain( "saber packet size mismatch" );
+		return;
+	}
+	if ( (int)( bladeOut - packet ) + ( BRIDGE_SABER_BLADE_SLOTS - slot ) * BRIDGE_SABER_BLADE_BYTES != BRIDGE_SABER_PACKET_SIZE ) {
+		Bridge_Complain( "saber packet size mismatch" );
+		return;
+	}
+
+	Bridge_Send( packet, BRIDGE_SABER_PACKET_SIZE );
+}
+
 void Bridge_Init( void )
 {
 	if ( s_inited ) {
@@ -363,4 +490,5 @@ void Bridge_Frame( int stereoView )
 
 	Bridge_MaybeSendMap( (uint32_t)cg.clientFrame, cg.time );
 	Bridge_SendPose( (uint32_t)cg.clientFrame, cg.time );
+	Bridge_MaybeSendSaber( &cg.predicted_player_state, &cg_entities[0], (uint32_t)cg.clientFrame, cg.time );
 }
