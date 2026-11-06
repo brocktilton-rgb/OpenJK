@@ -113,6 +113,9 @@ extern "C" Q_EXPORT intptr_t QDECL vmMain( int command, intptr_t arg0, intptr_t 
 		CG_Shutdown();
 		return 0;
 	case CG_CONSOLE_COMMAND:
+		if ( Bridge_ConsoleCommand() ) {
+			return qtrue;
+		}
 		return CG_ConsoleCommand();
 	case CG_DRAW_ACTIVE_FRAME:
 		CG_DrawActiveFrame( arg0, (stereoFrame_t) arg1 );

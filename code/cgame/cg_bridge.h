@@ -58,5 +58,6 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 void Bridge_Init( void );
 void Bridge_Shutdown( void );
 void Bridge_Frame( int stereoView );
+qboolean Bridge_ConsoleCommand( void );
 
 #endif

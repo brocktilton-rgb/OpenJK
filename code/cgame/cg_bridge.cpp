@@ -41,10 +41,16 @@ static vmCvar_t		bridge_rate;
 static qboolean		s_inited = qfalse;
 static qboolean		s_streaming = qfalse;
 static uint32_t		s_sequence = 1;
+static uint32_t		s_sentPose = 0;
+static uint32_t		s_sentMap = 0;
+static uint32_t		s_sentSaber = 0;
+static uint32_t		s_sendDrops = 0;
+static uint32_t		s_sendFails = 0;
 static int			s_lastPoseMs = 0;
 static int			s_lastMapMs = 0;
 static char			s_lastMap[BRIDGE_MAP_NAME_LEN];
 static char			s_lastComplain[256];
+static char			s_lastSendError[160];
 
 static uint8_t *Bridge_WriteU16( uint8_t *p, unsigned int value )
 {
@@ -153,18 +159,39 @@ static float Bridge_RenderedFrame( centity_t *cent, int bone, const lerpFrame_t 
 	return Bridge_BlendedFrame( fallback );
 }
 
+static void Bridge_NoteSendError( const char *msg )
+{
+	Q_strncpyz( s_lastSendError, msg, sizeof( s_lastSendError ) );
+	Bridge_Complain( msg );
+}
+
 static void Bridge_Send( const uint8_t *packet, int size )
 {
 	int result = BridgeNet_Send( packet, size );
+	unsigned int type = 0;
+
+	if ( size >= 8 ) {
+		type = (unsigned int)packet[6] | ( (unsigned int)packet[7] << 8 );
+	}
 	if ( result == 0 ) {
+		if ( type == BRIDGE_PACKET_POSE ) {
+			s_sentPose++;
+		} else if ( type == BRIDGE_PACKET_MAP ) {
+			s_sentMap++;
+		} else if ( type == BRIDGE_PACKET_SABER ) {
+			s_sentSaber++;
+		}
+		s_lastSendError[0] = '\0';
 		Bridge_ClearComplain();
 		return;
 	}
 	if ( result > 0 ) {
-		Bridge_Complain( "UDP send dropped (socket buffer full); frame skipped" );
+		s_sendDrops++;
+		Bridge_NoteSendError( "UDP send dropped (socket buffer full); frame skipped" );
 		return;
 	}
-	Bridge_Complain( "UDP send failed" );
+	s_sendFails++;
+	Bridge_NoteSendError( "UDP send failed" );
 }
 
 static void Bridge_MaybeSendMap( uint32_t frame, int serverTime )
@@ -410,7 +437,43 @@ void Bridge_Init( void )
 	cgi_Cvar_Register( &bridge_host, "bridge_host", "127.0.0.1", CVAR_ARCHIVE );
 	cgi_Cvar_Register( &bridge_port, "bridge_port", BRIDGE_DEFAULT_PORT, CVAR_ARCHIVE );
 	cgi_Cvar_Register( &bridge_rate, "bridge_rate", "0", CVAR_ARCHIVE );
+	cgi_AddCommand( "bridge_status" );
 	s_inited = qtrue;
+}
+
+qboolean Bridge_ConsoleCommand( void )
+{
+	int rate;
+
+	if ( Q_stricmp( CG_Argv( 0 ), "bridge_status" ) ) {
+		return qfalse;
+	}
+	if ( !s_inited ) {
+		Bridge_Init();
+	}
+	cgi_Cvar_Update( &bridge_enable );
+	cgi_Cvar_Update( &bridge_host );
+	cgi_Cvar_Update( &bridge_port );
+	cgi_Cvar_Update( &bridge_rate );
+	rate = bridge_rate.integer;
+	if ( rate < 0 ) {
+		rate = 0;
+	} else if ( rate > 480 ) {
+		rate = 480;
+	}
+
+	CG_Printf( "Bridge: OJB1 v%d\n", BRIDGE_VERSION );
+	CG_Printf( "  enabled: %s\n", bridge_enable.integer ? "yes" : "no" );
+	CG_Printf( "  streaming: %s\n", s_streaming ? "yes" : "no" );
+	CG_Printf( "  target: %s:%d\n", bridge_host.string, bridge_port.integer );
+	CG_Printf( "  rate: %d%s\n", rate, rate ? "" : " (every frame)" );
+	CG_Printf( "  packets sent: pose %u, map %u, saber %u (dropped %u, failed %u)\n",
+		s_sentPose, s_sentMap, s_sentSaber, s_sendDrops, s_sendFails );
+	CG_Printf( "  last send error: %s\n", s_lastSendError[0] ? s_lastSendError : "none" );
+	if ( !s_streaming && s_lastComplain[0] ) {
+		CG_Printf( "  not streaming: %s\n", s_lastComplain );
+	}
+	return qtrue;
 }
 
 void Bridge_Shutdown( void )
@@ -455,25 +518,35 @@ void Bridge_Frame( int stereoView )
 	cgi_Cvar_Update( &bridge_port );
 	cgi_Cvar_Update( &bridge_rate );
 
-	if ( !BridgeNet_Open( bridge_host.string, bridge_port.integer, &error ) ) {
-		if ( s_streaming ) {
-			BridgeNet_Close();
-			s_streaming = qfalse;
-		}
-		Bridge_Complain( error ? error : "could not open UDP socket" );
-		return;
-	}
-
-	if ( !s_streaming ) {
-		s_streaming = qtrue;
-		CG_Printf( "Bridge: UDP pose stream -> %s:%d\n", bridge_host.string, bridge_port.integer );
-	}
-
 	rate = bridge_rate.integer;
 	if ( rate < 0 ) {
 		rate = 0;
 	} else if ( rate > 480 ) {
 		rate = 480;
+	}
+
+	if ( !BridgeNet_Open( bridge_host.string, bridge_port.integer, &error ) ) {
+		char badHost[320];
+
+		if ( s_streaming ) {
+			BridgeNet_Close();
+			s_streaming = qfalse;
+		}
+		if ( error && !Q_stricmp( error, "bridge_host must be a numeric IPv4 address" ) ) {
+			Com_sprintf( badHost, sizeof( badHost ),
+				"bridge_host \"%s\" is not a numeric IPv4 address. Use 127.0.0.1. Not sending.",
+				bridge_host.string );
+			Bridge_Complain( badHost );
+		} else {
+			Bridge_Complain( error ? error : "could not open UDP socket" );
+		}
+		return;
+	}
+
+	if ( !s_streaming ) {
+		s_streaming = qtrue;
+		CG_Printf( "Bridge: OJB1 v%d UDP pose stream -> %s:%d (rate %d)\n",
+			BRIDGE_VERSION, bridge_host.string, bridge_port.integer, rate );
 	}
 	if ( rate > 0 ) {
 		interval = 1000 / rate;

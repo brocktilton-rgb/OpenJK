@@ -4,6 +4,101 @@ Proof of concept for a Jedi Academy remaster-as-mod. OpenJK stays the gameplay a
 
 The stream is single-player only. It is compiled into the SP game module (`jagame*.dll` / `jagame*.so`), which is where both the game and the client game live.
 
+## Install
+
+Use the CI build from this pull request, not the normal OpenJK download. The zip named like `OpenJK-windows-x86_64.zip` on the OpenJK releases page has no bridge. With that zip the console never prints a Bridge line and no packets are sent.
+
+1. On the pull request, open Checks. Open the job **Windows x86_64 Release (Non-Portable)**. Download the artifact **`OpenJK-windows-x86_64-Release-Non-Portable`**.
+2. Unzip it. You should see `openjk_sp.x86_64.exe` and a folder named `OpenJK`.
+3. Go to your retail GameData folder. Steam's copy is `steamapps\common\Jedi Academy\GameData`.
+4. Back up these three files (copy them somewhere else) before you replace them:
+   - `openjk_sp.x86_64.exe`
+   - `rdsp-vanilla_x86_64.dll`
+   - `OpenJK\jagamex86_64.dll`
+5. Copy those same three files from the zip over the ones in GameData. The dll goes in the `OpenJK` folder, not in `base`.
+6. Do not replace anything in `base\`. Do not add `+set fs_game` and do not create a mod folder. A second `jagamex86_64.dll` in `base\` or in `Documents\My Games\OpenJK\base\` is loaded instead of the one you just copied.
+
+A 32-bit install uses the artifact `OpenJK-windows-x86-Release-Non-Portable` and the names `openjk_sp.x86.exe`, `rdsp-vanilla_x86.dll`, and `OpenJK\jagamex86.dll`.
+
+## Launch
+
+Start the game from the GameData folder. `bridge_host` must be numbers and dots, such as `127.0.0.1`. A computer name is rejected. `bridge_port` stays `27420` unless you change both the game and the listener. `bridge_rate 0` sends every frame. A higher number is a cap, for example 30 packets a second.
+
+1. Open a command prompt in GameData.
+2. Run:
+
+```
+openjk_sp.x86_64.exe +set bridge_enable 1 +set bridge_host 127.0.0.1 +set bridge_port 27420 +set logfile 2 +devmap t1_rail
+```
+
+`+devmap t1_rail` starts the Pit level so you do not have to click through the menus. `+set logfile 2` writes every console line to `Documents\My Games\OpenJK\base\qconsole.log` as it happens.
+
+To cap the stream:
+
+```
+openjk_sp.x86_64.exe +set bridge_enable 1 +set bridge_host 127.0.0.1 +set bridge_port 27420 +set bridge_rate 30 +set logfile 2 +devmap t1_rail
+```
+
+After the level is up, the console should show:
+
+```
+Bridge: OJB1 v1 UDP pose stream -> 127.0.0.1:27420 (rate 0)
+```
+
+`OJB1 v1` is this protocol. An older dll will not print that line. In the console you can also type `bridge_status`. It prints whether the bridge is on, the address, how many pose, map, and saber packets were sent, and the last send error.
+
+Turn it off with `set bridge_enable 0`. These settings are saved, so the next launch keeps them until you set `bridge_enable` back to `0`.
+
+## How to check it
+
+1. The console line above must appear after the level starts. The main menu does not send packets.
+2. Open `Documents\My Games\OpenJK\base\qconsole.log` and search for `Bridge: OJB1 v1`. That file exists only if you launched with `+set logfile 2`.
+3. In PowerShell, check that the dll you installed is the bridge build. `True` means the string is there. `False` means this is the vanilla dll:
+
+```
+$dll = "C:\Program Files (x86)\Steam\steamapps\common\Jedi Academy\GameData\OpenJK\jagamex86_64.dll"
+[Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($dll)).Contains('bridge_enable')
+```
+
+Change the path if your GameData folder is somewhere else.
+
+4. From a copy of this repo, with Python 3 installed and no extra packages:
+
+```
+py -3 tools\bridge_receiver.py --self-test
+```
+
+That only checks the decoder. Then, before or while the game is running:
+
+```
+py -3 tools\bridge_receiver.py --port 27420 --summary
+```
+
+You should see a `map` line with `maps/t1_rail.bsp`, `pose` lines, and a `rate` line about once a second. `--summary` prints one pose a second instead of every frame. Drop `--summary` to print every packet. With the lightsaber out, a `saber` line is sent on the same frames. The Unreal saber picture is not hooked up yet, so you will not see the blade in the editor even though the packet is on the wire.
+
+## If nothing arrives
+
+1. You installed the vanilla `OpenJK-windows-x86_64.zip` from the OpenJK site. That build has no bridge. Use the CI artifact named `OpenJK-windows-x86_64-Release-Non-Portable` and replace all three files again.
+2. The PowerShell check printed `False`. Same problem: the dll on disk is not the bridge dll.
+3. Another `jagamex86_64.dll` is sitting in `GameData\base\` or in `Documents\My Games\OpenJK\base\`. The game loads that copy first. Remove it. Do not set `fs_game`.
+4. The game and the listener are not on the same port. Both must use `27420` unless you changed both.
+5. `bridge_host` is a name instead of numbers. The console warns once: `bridge_host "..." is not a numeric IPv4 address`. Set it to `127.0.0.1`.
+6. Windows Firewall asked and you blocked the game. Localhost usually does not ask. If it does, allow it on private networks, or keep both sides on `127.0.0.1`.
+7. You are still on the main menu. Start a level. `+devmap t1_rail` does that for you.
+8. Type `bridge_status` in the game console. `streaming: no` and a line under `not streaming` tell you why.
+
+## What you should see today
+
+The bridge sends the camera and the player pose, the map name, and (when the lightsaber is the weapon) the saber blades. It does not send the level mesh. In Unreal you get the camera motion and a ground plane. Rooms, doors, and characters from the map are not in the packets yet, so a ground-only view is the right result for this build.
+
+## Not done yet
+
+1. Level geometry (the BSP) and a way to export the world. Until that exists, Unreal cannot draw the rooms.
+2. Other entities and NPCs. Only the player pose is sent.
+3. Saber packets are in this build, but the Unreal saber picture was not checked, because that part of the editor is not hooked up yet.
+4. A list of hilt names (`saberInfo_t::name` values such as `Kyle`) is planned as `tools/list_saber_hilts.py`. That script is not in this branch.
+5. On GitHub, the macOS arm64 jobs and the Ubuntu Debug job have failed or been cancelled because the runner never started or the job hit the time limit. That is the build service, not this code. The job that matters for the Windows test is **Windows x86_64 Release (Non-Portable)**.
+
 ## Hook point
 
 The packet is built at the start of `CG_DrawActive` (`code/cgame/cg_draw.cpp`), after the snapshot check and before the stereo eye offset.
@@ -43,7 +138,7 @@ set bridge_enable 1
 set bridge_rate 30
 ```
 
-Turn it back off with `set bridge_enable 0`. Because the cvars are archived, that value is remembered in the OpenJK config.
+Turn it back off with `set bridge_enable 0`. Because the cvars are archived, that value is remembered in the OpenJK config. `bridge_status` prints the live settings and packet counts. The startup line is `Bridge: OJB1 v1 UDP pose stream -> 127.0.0.1:27420 (rate 0)`.
 
 ## Packet layout
 
@@ -170,40 +265,4 @@ Saber flags:
 | 0 | `0x01` | `dualSabers` |
 | 1 | `0x02` | `saberInFlight` (thrown; saber 0's blade follows the saber entity) |
 
-## Test on Windows with retail GameData
-
-Use the 64-bit Release Non-Portable artifact from this pull request's GitHub Actions run. The job name is **Windows x86_64 Release (Non-Portable)**. The artifact name is **`OpenJK-windows-x86_64-Release-Non-Portable`**. Non-Portable uses the same `Documents\My Games\OpenJK` config and saves as the official build. A 32-bit retail install wants `OpenJK-windows-x86-Release-Non-Portable` instead (`openjk_sp.x86.exe`, `rdsp-vanilla_x86.dll`, `OpenJK\jagamex86.dll`).
-
-1. On the PR, open **Checks**, then the Windows x86_64 Release (Non-Portable) job, and download the artifact (or use the run's **Artifacts** list). The zip root is the `JediAcademy` install tree.
-2. In the retail `GameData` folder (Steam: `steamapps\common\Jedi Academy\GameData`), back up and then replace these files from the zip:
-   - `openjk_sp.x86_64.exe`
-   - `rdsp-vanilla_x86_64.dll`
-   - `OpenJK\jagamex86_64.dll`
-
-   Leave `base\` and the `.pk3` assets alone. The bridge itself is inside `jagamex86_64.dll`. The matching exe and renderer come from the same build so the module interfaces stay paired. `OpenAL32.dll` already present from the official OpenJK build can stay.
-3. Install Python 3 if `py -3` is not already available. No packages to install.
-4. From a copy of this repo (the script is `tools/bridge_receiver.py`), start the listener first:
-
-   ```
-   py -3 tools\bridge_receiver.py --port 27420
-   ```
-
-   Add `--summary` to print one pose per second instead of every frame, or `--verbose` to include the camera axis. `--self-test` checks the decoder without the game.
-5. Launch the SP game from `GameData`:
-
-   ```
-   openjk_sp.x86_64.exe +set bridge_enable 1 +set bridge_host 127.0.0.1 +set bridge_port 27420
-   ```
-
-   Optional cap, for example 30 packets per second:
-
-   ```
-   openjk_sp.x86_64.exe +set bridge_enable 1 +set bridge_host 127.0.0.1 +set bridge_port 27420 +set bridge_rate 30
-   ```
-
-6. Start a new game or load a save. The console prints `Bridge: UDP pose stream -> 127.0.0.1:27420` when the first gameplay frame is drawn. The receiver prints `map` lines (`maps/<level>.bsp`) and `pose` lines, plus a `rate ... pkt/s` line every second. With the lightsaber equipped it also prints a `saber` line (hilt name, per-blade on/off, color, length, base, and tip) on the same frames.
-7. Stop streaming with `set bridge_enable 0` in the console, or quit. Quitting and level changes close the socket.
-
-Localhost UDP usually does not raise a firewall prompt. If Windows asks, allow it for private networks, or keep both sides on `127.0.0.1`.
-
-To point the stream at another machine, set `bridge_host` to that machine's numeric IPv4 address and run the receiver with `--host 0.0.0.0` so it accepts more than loopback.
+Windows install, launch, and checks are in the sections above. To point the stream at another machine, set `bridge_host` to that machine's numeric IPv4 address and run the receiver with `--host 0.0.0.0`.
