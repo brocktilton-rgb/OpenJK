@@ -22,15 +22,19 @@ VERSION = 1
 PACKET_POSE = 1
 PACKET_MAP = 2
 PACKET_SABER = 3
+PACKET_RENDER = 4
 POSE_SIZE = 160
 MAP_SIZE = 84
 SABER_SIZE = 672
+RENDER_SIZE = 228
 MAP_NAME_LEN = 64
 HILT_NAME_LEN = 64
 SABER_BLADE_SLOTS = 16
 SABER_BLADE_BYTES = 32
 SABER_FLAG_DUAL = 0x01
 SABER_FLAG_IN_FLIGHT = 0x02
+RENDER_HAND_R = 0x01
+RENDER_HAND_L = 0x02
 SABER_COLORS = ("red", "orange", "yellow", "green", "blue", "purple")
 SABER_TYPES = (
     "none", "single", "staff", "dagger", "broad", "prong", "arc",
@@ -150,8 +154,37 @@ def decode_packet(buf: bytes) -> dict:
         return header
     # One datagram is one packet. Unknown types are ignored so older readers
     # of type 1 and type 2 keep working when new types show up.
+    if kind == PACKET_RENDER:
+        if len(buf) < RENDER_SIZE:
+            raise PacketError("short render packet (%d < %d)" % (len(buf), RENDER_SIZE))
+        header["client_time"] = _i32(buf, 20)
+        header["player_origin"] = _vec3(buf, 24)
+        header["player_angles"] = _vec3(buf, 36)
+        header["cam_origin"] = _vec3(buf, 48)
+        header["cam_angles"] = _vec3(buf, 60)
+        header["cam_forward"] = _vec3(buf, 72)
+        header["cam_right"] = _vec3(buf, 84)
+        header["cam_up"] = _vec3(buf, 96)
+        header["fov_x"] = _f32(buf, 108)
+        header["fov_y"] = _f32(buf, 112)
+        header["legs_frame"] = _f32(buf, 116)
+        header["torso_frame"] = _f32(buf, 120)
+        header["origin_lerp"] = _f32(buf, 124)
+        header["hand_flags"] = buf[128]
+        header["hand_r"] = _read_hand(buf, 132)
+        header["hand_l"] = _read_hand(buf, 180)
+        return header
     header["skipped"] = True
     return header
+
+
+def _read_hand(buf: bytes, offset: int) -> dict:
+    return {
+        "origin": _vec3(buf, offset),
+        "axis_x": _vec3(buf, offset + 12),
+        "axis_y": _vec3(buf, offset + 24),
+        "axis_z": _vec3(buf, offset + 36),
+    }
 
 
 def _fmt_vec(value: tuple[float, float, float]) -> str:
@@ -233,6 +266,38 @@ def format_packet(packet: dict, verbose: bool) -> str:
                 )
             )
         return "\n".join(lines)
+    if packet["type"] == PACKET_RENDER:
+        hands = []
+        if packet["hand_flags"] & RENDER_HAND_R:
+            hands.append("R")
+        if packet["hand_flags"] & RENDER_HAND_L:
+            hands.append("L")
+        line = (
+            "render seq=%d frame=%d t=%d client=%d lerp=%.2f org=%s ang=%s "
+            "cam=%s fov=%.2fx%.2f frames=%.2f/%.2f hands=%s"
+            % (
+                packet["sequence"],
+                packet["frame"],
+                packet["server_time"],
+                packet["client_time"],
+                packet["origin_lerp"],
+                _fmt_vec(packet["player_origin"]),
+                _fmt_vec(packet["player_angles"]),
+                _fmt_vec(packet["cam_origin"]),
+                packet["fov_x"],
+                packet["fov_y"],
+                packet["legs_frame"],
+                packet["torso_frame"],
+                "".join(hands) or "-",
+            )
+        )
+        if verbose:
+            line += " axisF=%s handR=%s handL=%s" % (
+                _fmt_vec(packet["cam_forward"]),
+                _fmt_vec(packet["hand_r"]["origin"]),
+                _fmt_vec(packet["hand_l"]["origin"]),
+            )
+        return line
     if packet["type"] == PACKET_MAP:
         return "map  seq=%d frame=%d t=%d name=%s" % (
             packet["sequence"], packet["frame"], packet["server_time"], packet["map_name"] or '""'
@@ -365,6 +430,29 @@ def _pack_saber() -> bytes:
     return bytes(buf)
 
 
+def _pack_render() -> bytes:
+    buf = bytearray(RENDER_SIZE)
+    struct.pack_into("<4sHHIIi", buf, 0, MAGIC, VERSION, PACKET_RENDER, 11, 42, 1600)
+    struct.pack_into("<i", buf, 20, 5000)
+    struct.pack_into("<3f", buf, 24, 1.0, 2.0, 3.0)
+    struct.pack_into("<3f", buf, 36, 0.0, 90.0, 0.0)
+    struct.pack_into("<3f", buf, 48, 4.0, 5.0, 6.0)
+    struct.pack_into("<3f", buf, 60, -5.0, 90.0, 0.0)
+    struct.pack_into("<9f", buf, 72, 1, 0, 0, 0, -1, 0, 0, 0, 1)
+    struct.pack_into("<2f", buf, 108, 80.0, 64.0)
+    struct.pack_into("<2f", buf, 116, 12.5, 4.25)
+    struct.pack_into("<f", buf, 124, 0.5)
+    buf[128] = RENDER_HAND_R | RENDER_HAND_L
+    struct.pack_into("<3f", buf, 132, 10, 0, 40)
+    struct.pack_into("<3f", buf, 144, 1, 0, 0)
+    struct.pack_into("<3f", buf, 156, 0, -1, 0)
+    struct.pack_into("<3f", buf, 168, 0, 0, 1)
+    struct.pack_into("<3f", buf, 180, -10, 0, 40)
+    if len(buf) != RENDER_SIZE:
+        raise AssertionError("render pack size %d" % len(buf))
+    return bytes(buf)
+
+
 def self_test() -> int:
     pose = decode_packet(_pack_pose())
     assert pose["sequence"] == 7
@@ -399,6 +487,20 @@ def self_test() -> int:
     assert saber["blades"][0]["base"] == (1.0, 2.0, 3.0)
     assert saber["blades"][0]["tip"] == (33.0, 2.0, 3.0)
     assert saber["blades"][1]["active"] == 0 and saber["blades"][1]["blade_index"] == 1
+
+    render = decode_packet(_pack_render())
+    assert render["client_time"] == 5000
+    assert render["player_origin"] == (1.0, 2.0, 3.0)
+    assert render["player_angles"] == (0.0, 90.0, 0.0)
+    assert render["cam_origin"] == (4.0, 5.0, 6.0)
+    assert render["cam_forward"] == (1.0, 0.0, 0.0)
+    assert render["cam_right"] == (0.0, -1.0, 0.0)
+    assert render["origin_lerp"] == 0.5
+    assert render["legs_frame"] == 12.5 and render["torso_frame"] == 4.25
+    assert render["hand_flags"] == (RENDER_HAND_R | RENDER_HAND_L)
+    assert render["hand_r"]["origin"] == (10.0, 0.0, 40.0)
+    assert render["hand_r"]["axis_y"] == (0.0, -1.0, 0.0)
+    assert render["hand_l"]["origin"] == (-10.0, 0.0, 40.0)
     # Type 1 and type 2 still decode after a type 3 packet, and unknown types are skipped.
     assert decode_packet(_pack_pose())["type"] == PACKET_POSE
     unknown = bytearray(24)
@@ -417,7 +519,7 @@ def self_test() -> int:
         sock.bind(("127.0.0.1", 0))
         sock.settimeout(2.0)
         dest = sock.getsockname()
-        for payload in (_pack_map(), _pack_pose(), _pack_saber()):
+        for payload in (_pack_map(), _pack_pose(), _pack_saber(), _pack_render()):
             sent = sock.sendto(payload, dest)
             if sent != len(payload):
                 raise AssertionError("short UDP send")
@@ -428,12 +530,17 @@ def self_test() -> int:
                 assert decoded["map_name"] == "maps/kejim_post.bsp"
             elif kind == PACKET_POSE:
                 assert decoded["cam_origin"] == (10.0, 20.0, 30.0)
-            else:
+            elif kind == PACKET_SABER:
                 assert decoded["hilt0"] == "Kyle" and len(decoded["blades"]) == 2
+            else:
+                assert decoded["hand_r"]["origin"] == (10.0, 0.0, 40.0)
     finally:
         sock.close()
 
-    print("bridge_receiver self-test ok (pose %d bytes, map %d bytes, saber %d bytes)" % (POSE_SIZE, MAP_SIZE, SABER_SIZE))
+    print(
+        "bridge_receiver self-test ok (pose %d, map %d, saber %d, render %d bytes)"
+        % (POSE_SIZE, MAP_SIZE, SABER_SIZE, RENDER_SIZE)
+    )
     return 0
 
 
@@ -447,8 +554,8 @@ def listen(host: str, port: int, verbose: bool, summary: bool) -> int:
         return 1
 
     print(
-        "OpenJK bridge receiver listening on %s:%d (pose %d, map %d, saber %d bytes, version %d)"
-        % (host, port, POSE_SIZE, MAP_SIZE, SABER_SIZE, VERSION),
+        "OpenJK bridge receiver listening on %s:%d (pose %d, map %d, saber %d, render %d bytes, version %d)"
+        % (host, port, POSE_SIZE, MAP_SIZE, SABER_SIZE, RENDER_SIZE, VERSION),
         flush=True,
     )
     print("Ctrl+C to stop. Start a level in OpenJK; the main menu does not send poses.", flush=True)
@@ -461,6 +568,7 @@ def listen(host: str, port: int, verbose: bool, summary: bool) -> int:
     poses = 0
     maps = 0
     sabers = 0
+    renders = 0
     skipped = 0
     last_pose = None
 
@@ -490,6 +598,8 @@ def listen(host: str, port: int, verbose: bool, summary: bool) -> int:
                     maps += 1
                 elif packet["type"] == PACKET_SABER:
                     sabers += 1
+                elif packet["type"] == PACKET_RENDER:
+                    renders += 1
                 if not summary:
                     suffix = "" if missed == 0 else "  gap=%d" % missed
                     print(format_packet(packet, verbose) + suffix, flush=True)
@@ -501,8 +611,8 @@ def listen(host: str, port: int, verbose: bool, summary: bool) -> int:
             if elapsed >= 1.0:
                 rate = window_count / elapsed
                 print(
-                    "rate %.1f pkt/s  window=%d total=%d pose=%d map=%d saber=%d skip=%d bad=%d seq_gaps=%d"
-                    % (rate, window_count, total, poses, maps, sabers, skipped, bad, tracker.gaps),
+                    "rate %.1f pkt/s  window=%d total=%d pose=%d map=%d saber=%d render=%d skip=%d bad=%d seq_gaps=%d"
+                    % (rate, window_count, total, poses, maps, sabers, renders, skipped, bad, tracker.gaps),
                     flush=True,
                 )
                 if summary and last_pose is not None:
@@ -510,7 +620,10 @@ def listen(host: str, port: int, verbose: bool, summary: bool) -> int:
                 window_start = now
                 window_count = 0
     except KeyboardInterrupt:
-        print("\nstopped. total=%d pose=%d map=%d saber=%d skip=%d bad=%d seq_gaps=%d" % (total, poses, maps, sabers, skipped, bad, tracker.gaps))
+        print(
+            "\nstopped. total=%d pose=%d map=%d saber=%d render=%d skip=%d bad=%d seq_gaps=%d"
+            % (total, poses, maps, sabers, renders, skipped, bad, tracker.gaps)
+        )
         return 0
     finally:
         sock.close()

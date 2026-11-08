@@ -31,6 +31,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #define BRIDGE_PACKET_POSE			1
 #define BRIDGE_PACKET_MAP			2
 #define BRIDGE_PACKET_SABER			3
+#define BRIDGE_PACKET_RENDER		4
 
 // Common header is 20 bytes. Sizes include that header.
 // Type 1 and type 2 layouts are frozen. New packets use a new type.
@@ -46,6 +47,11 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 
 #define BRIDGE_SABER_DUAL			0x01u
 #define BRIDGE_SABER_IN_FLIGHT		0x02u
+
+// Type 4. Hand matrices are Ghoul2 3x4 columns: origin, +X, +Y, +Z.
+#define BRIDGE_RENDER_PACKET_SIZE	228
+#define BRIDGE_RENDER_HAND_R		0x01u
+#define BRIDGE_RENDER_HAND_L		0x02u
 
 #define BRIDGE_DEFAULT_PORT			"27420"
 

@@ -91,6 +91,8 @@ You should see a `map` line with `maps/t1_rail.bsp`, `pose` lines, and a `rate` 
 
 The bridge sends the camera and the player pose, the map name, and (when the lightsaber is the weapon) the saber blades. It does not send the level mesh. In Unreal you get the camera motion and a ground plane. Rooms, doors, and characters from the map are not in the packets yet, so a ground-only view is the right result for this build.
 
+A client that only reads type 1 will still see the body step about 20 times a second. That packet is sent every render frame, but the origin inside it only changes on the server tick. Type 4 is the smooth pose. Point the new Unreal reader at type 4.
+
 ## Not done yet
 
 1. Level geometry (the BSP) and a way to export the world. Until that exists, Unreal cannot draw the rooms.
@@ -152,7 +154,7 @@ World space is id Tech 3 / Jedi Academy: **+X forward, +Y left, +Z up**, in game
 2. right (`viewaxis[1]`, which is `(0, -1, 0)` at the identity view, because +Y is left)
 3. up (`viewaxis[2]`)
 
-`serverTime` is `cg.time` in milliseconds (pauses and timescale affect it). `frame` is `cg.clientFrame`. `sequence` increments by one for every datagram the game attempts to send (map, pose, and saber), and resets to 1 on shutdown. A gap in `sequence` is a dropped datagram. A gap in `frame` while `sequence` stays contiguous is the rate limit (or a skipped stereo eye).
+`serverTime` is `cg.time` in milliseconds (pauses and timescale affect it). `frame` is `cg.clientFrame`. `sequence` increments by one for every datagram the game attempts to send (map, pose, saber, and render), and resets to 1 on shutdown. A gap in `sequence` is a dropped datagram. A gap in `frame` while `sequence` stays contiguous is the rate limit (or a skipped stereo eye).
 
 Each datagram is one packet. Readers that only know type 1 and type 2 drop any other type. Those two layouts are unchanged, so an older `OJB1` reader keeps working. Type 3 is an additional datagram, not a change to the pose packet.
 
@@ -162,7 +164,7 @@ Each datagram is one packet. Readers that only know type 1 and type 2 drop any o
 | ---: | ---: | --- | --- |
 | 0 | 4 | char[4] | magic `OJB1` |
 | 4 | 2 | uint16 | version = 1 |
-| 6 | 2 | uint16 | type: `1` pose, `2` map, `3` saber |
+| 6 | 2 | uint16 | type: `1` pose, `2` map, `3` saber, `4` render pose |
 | 8 | 4 | uint32 | sequence |
 | 12 | 4 | uint32 | frame (`cg.clientFrame`) |
 | 16 | 4 | int32 | serverTime (`cg.time`, ms) |
@@ -264,5 +266,47 @@ Saber flags:
 | ---: | --- | --- |
 | 0 | `0x01` | `dualSabers` |
 | 1 | `0x02` | `saberInFlight` (thrown; saber 0's blade follows the saber entity) |
+
+Type 3 base and tip are `blade.muzzlePoint` and `muzzlePoint + muzzleDir * length`. `CG_AddSaberBladeGo` writes those two vectors while it draws the blade, earlier in the same frame as this packet. A blade with length 0 is not redrawn, so its muzzle can be zero or left over from the last time it was on.
+
+### Why the body steps, and the render packet (type 4, 228 bytes)
+
+Type 1, 2, and 3 are sent from `CG_DrawActive`, once per client render frame (`com_maxfps`, default 125), still capped by `bridge_rate` when that is not 0. They are not sent once per snapshot.
+
+The origin in type 1 is still `cent->lerpOrigin`. For the local player that is copied from `cg.predicted_player_state.origin`. In single-player, prediction does not run a client pmove. It copies the latest snapshot and only lerps when a future snapshot exists. The local server is usually caught up, so there is no future snapshot. The origin therefore changes when `sv_fps` runs (default 20). View angles from the latest command do update every render frame, but the body position does not. That is the 15–20 Hz step.
+
+Type 4 does not change those packets. It is an extra datagram on the same sample. Its player origin is the type 1 origin played smoothly across the gap until the next server tick, so it moves every render frame and sits about one tick behind the game. The camera axis and angles are the real `cg.refdef` for this frame (mouse look is not delayed). The camera origin is `cg.refdef.vieworg` shifted by the same smoothing offset, so the third-person gap and view bob stay, without the 20 Hz jump. A jump bigger than 200 units (a teleport) is not smoothed.
+
+Ghoul2 frames are the fractional frame `G2API_GetBoneAnimIndex` returns for this `cg.time`: legs from the root bone, torso from the lower lumbar bone. That is the frame the renderer is using, including the blend fraction.
+
+Each hand is the player model's `*r_hand` or `*l_hand` bolt, from `G2API_GetBoltMatrix`, using the same yaw, origin, time, and model scale `CG_Player` uses when it reads `handRBolt` / `handLBolt` this frame. The matrix is Ghoul2's 3×4: three rows, four columns. Column 0 is the bone's +X axis, column 1 is +Y, column 2 is +Z, column 3 is the origin. The packet stores origin, then +X, +Y, +Z, each as XYZ in world space. Axes are columns, not rows. World space is the same as the other packets: **+X forward, +Y left, +Z up**, game units. The right slot is always `*r_hand`. The left slot is `*l_hand`, including when only one saber is equipped, so the empty hand is still there. A cleared flag means that matrix is zero.
+
+| Offset | Size | Type | Field |
+| ---: | ---: | --- | --- |
+| 0 | 20 | header | type = 4. `serverTime` is `cg.time` |
+| 20 | 4 | int32 | `clientTime`, `cgi_Milliseconds` |
+| 24 | 12 | float[3] | smoothed player origin |
+| 36 | 12 | float[3] | player angles this frame (`lerpAngles`, pitch, yaw, roll) |
+| 48 | 12 | float[3] | smoothed camera origin |
+| 60 | 12 | float[3] | camera angles (`refdefViewAngles`) |
+| 72 | 36 | float[9] | camera axis, forward, then right, then up |
+| 108 | 4 | float | fovX |
+| 112 | 4 | float | fovY |
+| 116 | 4 | float | legs frame (Ghoul2 root, fractional) |
+| 120 | 4 | float | torso frame (Ghoul2 lower lumbar, fractional) |
+| 124 | 4 | float | origin lerp, 0 at the previous tick, 1 at the current one |
+| 128 | 1 | uint8 | hand flags |
+| 129 | 3 | bytes | zero padding |
+| 132 | 48 | 12 floats | right hand: origin, +X, +Y, +Z |
+| 180 | 48 | 12 floats | left hand: origin, +X, +Y, +Z |
+
+Hand flags:
+
+| Bit | Mask | Meaning |
+| ---: | --- | --- |
+| 0 | `0x01` | right hand (`*r_hand`) matrix is valid |
+| 1 | `0x02` | left hand (`*l_hand`) matrix is valid |
+
+With `bridge_rate 0`, type 4 goes out on every rendered frame, the same rate as type 1 (default `com_maxfps` 125). The smoothed origin changes on those frames. Type 1's origin field is unchanged and still steps with the server tick.
 
 Windows install, launch, and checks are in the sections above. To point the stream at another machine, set `bridge_host` to that machine's numeric IPv4 address and run the receiver with `--host 0.0.0.0`.

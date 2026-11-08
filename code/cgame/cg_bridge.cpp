@@ -44,6 +44,7 @@ static uint32_t		s_sequence = 1;
 static uint32_t		s_sentPose = 0;
 static uint32_t		s_sentMap = 0;
 static uint32_t		s_sentSaber = 0;
+static uint32_t		s_sentRender = 0;
 static uint32_t		s_sendDrops = 0;
 static uint32_t		s_sendFails = 0;
 static int			s_lastPoseMs = 0;
@@ -51,6 +52,16 @@ static int			s_lastMapMs = 0;
 static char			s_lastMap[BRIDGE_MAP_NAME_LEN];
 static char			s_lastComplain[256];
 static char			s_lastSendError[160];
+
+// Last two simulation positions. SP usually has no future snapshot, so
+// lerpOrigin only moves on the server tick (sv_fps, default 20). Type 4
+// plays that step across the following client frames.
+static qboolean		s_haveOrigin = qfalse;
+static int			s_originSnapTime = 0;
+static int			s_originSpan = 50;
+static int			s_originSampleMs = 0;
+static vec3_t		s_originFrom;
+static vec3_t		s_originTo;
 
 static uint8_t *Bridge_WriteU16( uint8_t *p, unsigned int value )
 {
@@ -180,6 +191,8 @@ static void Bridge_Send( const uint8_t *packet, int size )
 			s_sentMap++;
 		} else if ( type == BRIDGE_PACKET_SABER ) {
 			s_sentSaber++;
+		} else if ( type == BRIDGE_PACKET_RENDER ) {
+			s_sentRender++;
 		}
 		s_lastSendError[0] = '\0';
 		Bridge_ClearComplain();
@@ -325,7 +338,9 @@ static int Bridge_ClampBladeCount( int numBlades )
 	return numBlades;
 }
 
-// tip = muzzlePoint + muzzleDir * length, the segment cgame already used to draw the blade.
+// tip = muzzlePoint + muzzleDir * length. CG_AddSaberBladeGo writes both
+// vectors while drawing the blade, earlier in this same frame, so type 3
+// matches the segment the renderer just used.
 static uint8_t *Bridge_WriteBlade( uint8_t *p, int saberIndex, int bladeIndex, const bladeInfo_t *blade )
 {
 	vec3_t tip;
@@ -427,6 +442,206 @@ static void Bridge_MaybeSendSaber( const playerState_t *ps, const centity_t *cen
 	Bridge_Send( packet, BRIDGE_SABER_PACKET_SIZE );
 }
 
+// Spread one sv_fps step across the following client frames. The result is
+// one simulation step behind the raw origin, and it moves every render frame.
+static void Bridge_SmoothOrigin( const vec3_t raw, vec3_t out, float *outFrac )
+{
+	int now = cgi_Milliseconds();
+	int snapTime = ( cg.snap ) ? cg.snap->serverTime : 0;
+	vec3_t delta;
+	float dist;
+	float frac;
+	int i;
+
+	VectorSubtract( raw, s_originTo, delta );
+	dist = VectorLength( delta );
+	if ( !s_haveOrigin || dist > 200.0f ) {
+		VectorCopy( raw, s_originFrom );
+		VectorCopy( raw, s_originTo );
+		s_originSampleMs = now;
+		s_originSpan = 50;
+		s_originSnapTime = snapTime;
+		s_haveOrigin = qtrue;
+		VectorCopy( raw, out );
+		*outFrac = 1.0f;
+		return;
+	}
+
+	if ( snapTime != s_originSnapTime ) {
+		int span = now - s_originSampleMs;
+		vec3_t shown;
+
+		if ( span < 1 ) {
+			span = 1;
+		} else if ( span > 200 ) {
+			span = 200;
+		}
+		frac = (float)( now - s_originSampleMs ) / (float)s_originSpan;
+		if ( frac < 0.0f ) {
+			frac = 0.0f;
+		} else if ( frac > 1.0f ) {
+			frac = 1.0f;
+		}
+		for ( i = 0; i < 3; ++i ) {
+			shown[i] = s_originFrom[i] + frac * ( s_originTo[i] - s_originFrom[i] );
+		}
+		VectorCopy( shown, s_originFrom );
+		VectorCopy( raw, s_originTo );
+		s_originSpan = span;
+		s_originSampleMs = now;
+		s_originSnapTime = snapTime;
+	}
+
+	frac = (float)( now - s_originSampleMs ) / (float)s_originSpan;
+	if ( frac < 0.0f ) {
+		frac = 0.0f;
+	} else if ( frac > 1.0f ) {
+		frac = 1.0f;
+	}
+	for ( i = 0; i < 3; ++i ) {
+		out[i] = s_originFrom[i] + frac * ( s_originTo[i] - s_originFrom[i] );
+	}
+	*outFrac = frac;
+}
+
+// Ghoul2 bolt matrix is 3 rows by 4 columns. Columns are +X, +Y, +Z, origin.
+static qboolean Bridge_ReadHandBolt( centity_t *cent, int bolt, const vec3_t angles, const vec3_t origin, vec3_t outOrg, vec3_t outX, vec3_t outY, vec3_t outZ )
+{
+	mdxaBone_t boltMatrix;
+	int model;
+
+	if ( !cent || !cent->gent || bolt < 0 ) {
+		return qfalse;
+	}
+	model = cent->gent->playerModel;
+	if ( model < 0 || cent->gent->ghoul2.size() <= model ) {
+		return qfalse;
+	}
+	if ( !gi.G2API_GetBoltMatrix( cent->gent->ghoul2, model, bolt, &boltMatrix, angles, origin,
+			cg.time, cgs.model_draw, cent->currentState.modelScale ) ) {
+		return qfalse;
+	}
+	outX[0] = boltMatrix.matrix[0][0];
+	outX[1] = boltMatrix.matrix[1][0];
+	outX[2] = boltMatrix.matrix[2][0];
+	outY[0] = boltMatrix.matrix[0][1];
+	outY[1] = boltMatrix.matrix[1][1];
+	outY[2] = boltMatrix.matrix[2][1];
+	outZ[0] = boltMatrix.matrix[0][2];
+	outZ[1] = boltMatrix.matrix[1][2];
+	outZ[2] = boltMatrix.matrix[2][2];
+	outOrg[0] = boltMatrix.matrix[0][3];
+	outOrg[1] = boltMatrix.matrix[1][3];
+	outOrg[2] = boltMatrix.matrix[2][3];
+	return qtrue;
+}
+
+static uint8_t *Bridge_WriteHand( uint8_t *p, const vec3_t org, const vec3_t axisX, const vec3_t axisY, const vec3_t axisZ )
+{
+	p = Bridge_WriteVec3( p, org );
+	p = Bridge_WriteVec3( p, axisX );
+	p = Bridge_WriteVec3( p, axisY );
+	p = Bridge_WriteVec3( p, axisZ );
+	return p;
+}
+
+static void Bridge_SendRender( const playerState_t *ps, centity_t *cent, uint32_t frame, int serverTime )
+{
+	uint8_t packet[BRIDGE_RENDER_PACKET_SIZE];
+	uint8_t *p;
+	uint8_t *flagByte;
+	vec3_t rawOrigin;
+	vec3_t smoothOrigin;
+	vec3_t playerAngles;
+	vec3_t camOrigin;
+	vec3_t boltAngles;
+	vec3_t boltOrigin;
+	vec3_t handOrg;
+	vec3_t handX;
+	vec3_t handY;
+	vec3_t handZ;
+	int rightBolt = -1;
+	int leftBolt = -1;
+	float originLerp = 1.0f;
+	float legsFrame = 0.0f;
+	float torsoFrame = 0.0f;
+	unsigned int handFlags = 0;
+
+	static_assert( BRIDGE_RENDER_PACKET_SIZE == 228, "render packet size drifted" );
+
+	VectorClear( rawOrigin );
+	VectorClear( playerAngles );
+	if ( cent && cent->currentValid ) {
+		VectorCopy( cent->lerpOrigin, rawOrigin );
+		VectorCopy( cent->lerpAngles, playerAngles );
+		legsFrame = Bridge_RenderedFrame( cent, cent->gent ? cent->gent->rootBone : -1, &cent->pe.legs );
+		torsoFrame = Bridge_RenderedFrame( cent, cent->gent ? cent->gent->lowerLumbarBone : -1, &cent->pe.torso );
+	} else if ( ps ) {
+		VectorCopy( ps->origin, rawOrigin );
+		VectorCopy( ps->viewangles, playerAngles );
+	}
+	Bridge_SmoothOrigin( rawOrigin, smoothOrigin, &originLerp );
+	VectorSubtract( smoothOrigin, rawOrigin, camOrigin );
+	VectorAdd( cg.refdef.vieworg, camOrigin, camOrigin );
+
+	memset( packet, 0, sizeof( packet ) );
+	p = Bridge_WriteHeader( packet, BRIDGE_PACKET_RENDER, s_sequence++, frame, serverTime );
+	p = Bridge_WriteI32( p, cgi_Milliseconds() );
+	p = Bridge_WriteVec3( p, smoothOrigin );
+	p = Bridge_WriteVec3( p, playerAngles );
+	p = Bridge_WriteVec3( p, camOrigin );
+	p = Bridge_WriteVec3( p, cg.refdefViewAngles );
+	p = Bridge_WriteVec3( p, cg.refdef.viewaxis[0] );
+	p = Bridge_WriteVec3( p, cg.refdef.viewaxis[1] );
+	p = Bridge_WriteVec3( p, cg.refdef.viewaxis[2] );
+	p = Bridge_WriteF32( p, cg.refdef.fov_x );
+	p = Bridge_WriteF32( p, cg.refdef.fov_y );
+	p = Bridge_WriteF32( p, legsFrame );
+	p = Bridge_WriteF32( p, torsoFrame );
+	p = Bridge_WriteF32( p, originLerp );
+
+	VectorClear( boltAngles );
+	VectorCopy( rawOrigin, boltOrigin );
+	if ( cent && cent->gent && cent->currentValid ) {
+		boltAngles[YAW] = cent->renderAngles[YAW];
+		rightBolt = cent->gent->handRBolt;
+		leftBolt = cent->gent->handLBolt;
+		if ( cent->currentState.modelScale[2] && cent->currentState.modelScale[2] != 1.0f ) {
+			boltOrigin[2] += 24.0f * ( cent->currentState.modelScale[2] - 1.0f );
+		}
+	}
+
+	if ( Bridge_ReadHandBolt( cent, rightBolt, boltAngles, boltOrigin, handOrg, handX, handY, handZ ) ) {
+		handFlags |= BRIDGE_RENDER_HAND_R;
+	} else {
+		VectorClear( handOrg );
+		VectorClear( handX );
+		VectorClear( handY );
+		VectorClear( handZ );
+	}
+	flagByte = p;
+	p = Bridge_WriteU8( p, (unsigned int)handFlags );
+	p = Bridge_WriteU8( p, 0 );
+	p = Bridge_WriteU16( p, 0 );
+	p = Bridge_WriteHand( p, handOrg, handX, handY, handZ );
+
+	if ( Bridge_ReadHandBolt( cent, leftBolt, boltAngles, boltOrigin, handOrg, handX, handY, handZ ) ) {
+		*flagByte = (uint8_t)( *flagByte | BRIDGE_RENDER_HAND_L );
+	} else {
+		VectorClear( handOrg );
+		VectorClear( handX );
+		VectorClear( handY );
+		VectorClear( handZ );
+	}
+	p = Bridge_WriteHand( p, handOrg, handX, handY, handZ );
+
+	if ( (int)( p - packet ) != BRIDGE_RENDER_PACKET_SIZE ) {
+		Bridge_Complain( "render packet size mismatch" );
+		return;
+	}
+	Bridge_Send( packet, BRIDGE_RENDER_PACKET_SIZE );
+}
+
 void Bridge_Init( void )
 {
 	if ( s_inited ) {
@@ -467,8 +682,8 @@ qboolean Bridge_ConsoleCommand( void )
 	CG_Printf( "  streaming: %s\n", s_streaming ? "yes" : "no" );
 	CG_Printf( "  target: %s:%d\n", bridge_host.string, bridge_port.integer );
 	CG_Printf( "  rate: %d%s\n", rate, rate ? "" : " (every frame)" );
-	CG_Printf( "  packets sent: pose %u, map %u, saber %u (dropped %u, failed %u)\n",
-		s_sentPose, s_sentMap, s_sentSaber, s_sendDrops, s_sendFails );
+	CG_Printf( "  packets sent: pose %u, map %u, saber %u, render %u (dropped %u, failed %u)\n",
+		s_sentPose, s_sentMap, s_sentSaber, s_sentRender, s_sendDrops, s_sendFails );
 	CG_Printf( "  last send error: %s\n", s_lastSendError[0] ? s_lastSendError : "none" );
 	if ( !s_streaming && s_lastComplain[0] ) {
 		CG_Printf( "  not streaming: %s\n", s_lastComplain );
@@ -485,6 +700,8 @@ void Bridge_Shutdown( void )
 	s_lastMapMs = 0;
 	s_lastMap[0] = '\0';
 	s_lastComplain[0] = '\0';
+	s_haveOrigin = qfalse;
+	s_originSnapTime = 0;
 }
 
 void Bridge_Frame( int stereoView )
@@ -564,4 +781,5 @@ void Bridge_Frame( int stereoView )
 	Bridge_MaybeSendMap( (uint32_t)cg.clientFrame, cg.time );
 	Bridge_SendPose( (uint32_t)cg.clientFrame, cg.time );
 	Bridge_MaybeSendSaber( &cg.predicted_player_state, &cg_entities[0], (uint32_t)cg.clientFrame, cg.time );
+	Bridge_SendRender( &cg.predicted_player_state, &cg_entities[0], (uint32_t)cg.clientFrame, cg.time );
 }
