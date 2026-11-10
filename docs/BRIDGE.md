@@ -129,7 +129,8 @@ All four are archived. The default is off.
 | `bridge_enable` | `0` | `1` streams. `0` closes the socket. |
 | `bridge_host` | `127.0.0.1` | Numeric IPv4 only. Hostnames are rejected so the game cannot block in DNS. |
 | `bridge_port` | `27420` | UDP destination port. |
-| `bridge_rate` | `0` | Maximum samples per second, using client realtime. `0` sends every rendered frame. Clamped to 480. The interval is `1000 / rate` milliseconds. A sample is the map packet (when one is due), the pose packet, and the saber packet when a lightsaber is out. |
+| `bridge_rate` | `0` | Maximum samples per second, using client realtime. `0` sends every rendered frame. Clamped to 480. The interval is `1000 / rate` milliseconds. A sample is the map packet (when one is due), the pose packet, the saber packet when a lightsaber is out, the render packet, and the NPC packets. |
+| `bridge_npc_radius` | `4096` | NPCs farther than this from the camera are left out of type 5. `0` means no limit. |
 
 Changing host or port reopens the socket on the next frame. A rejected host stops the stream until the value is a numeric IPv4 address again.
 
@@ -308,5 +309,44 @@ Hand flags:
 | 1 | `0x02` | left hand (`*l_hand`) matrix is valid |
 
 With `bridge_rate 0`, type 4 goes out on every rendered frame, the same rate as type 1 (default `com_maxfps` 125). The smoothed origin changes on those frames. Type 1's origin field is unchanged and still steps with the server tick.
+
+### NPC packet (type 5)
+
+Sent on the same samples as type 4, under the same `bridge_rate` cap, to the same address. One frame can be several datagrams. They share one `sequence` and one `frame`. Each holds at most 10 NPCs. An empty frame is one datagram with `count` 0.
+
+An NPC is an entity in `cg.snap` whose `gent` has `NPC` or `client`, and is not the player. Dead bodies stay in the list while that entity still exists. `bridge_npc_radius` (default 4096, `0` = no limit) measures distance from `cg.refdef.vieworg` to `cent->lerpOrigin`.
+
+World space matches the other packets: **+X forward, +Y left, +Z up**, game units. Angles are pitch, yaw, roll. `legsFrame` and `torsoFrame` are the same Ghoul2 fractional frames as type 4 (root bone and lower lumbar). `trDelta` is `currentState.pos.trDelta`. `NPC_type` is `gent->NPC_type`, truncated to 31 characters plus a NUL. The hash is FNV-1a 32-bit of that name in lowercase (offset basis `2166136261`, prime `16777619`).
+
+`state`: `0` alive (`health > 0`), `1` dying (`health <= 0` and the legs anim is still in `BOTH_DEATH1` .. `BOTH_DEAD1`), `2` dead. `flags`: `0x01` newly seen this frame or `EF_TELEPORT_BIT` flipped, `0x02` weapon is not `WP_NONE`, `0x04` saber is active. Anim numbers have `ANIM_TOGGLEBIT` (`2048`) cleared.
+
+| Offset | Size | Type | Field |
+| ---: | ---: | --- | --- |
+| 0 | 20 | header | type = 5 |
+| 20 | 2 | uint16 | `count` (entries in this datagram) |
+| 22 | 2 | uint16 | `total` (NPCs this frame, all datagrams) |
+| 24 | 1 | uint8 | `packetIndex` (0-based) |
+| 25 | 1 | uint8 | `packetCount` |
+| 26 | 2 | uint16 | reserved, 0 |
+| 28 | 100 × count | entries | at most 10; datagram is at most 1028 bytes |
+
+Each entry:
+
+| Offset | Size | Type | Field |
+| ---: | ---: | --- | --- |
+| 0 | 2 | uint16 | entity number |
+| 2 | 1 | uint8 | state |
+| 3 | 1 | uint8 | flags |
+| 4 | 4 | uint32 | FNV-1a-32 of lowercase `NPC_type` |
+| 8 | 12 | float[3] | `lerpOrigin` |
+| 20 | 12 | float[3] | `lerpAngles` |
+| 32 | 4 | int32 | legs anim |
+| 36 | 4 | int32 | torso anim |
+| 40 | 4 | float | legs frame |
+| 44 | 4 | float | torso frame |
+| 48 | 4 | int32 | weapon |
+| 52 | 4 | int32 | health |
+| 56 | 12 | float[3] | `pos.trDelta` |
+| 68 | 32 | char[32] | `NPC_type` |
 
 Windows install, launch, and checks are in the sections above. To point the stream at another machine, set `bridge_host` to that machine's numeric IPv4 address and run the receiver with `--host 0.0.0.0`.

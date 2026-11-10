@@ -32,6 +32,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #define BRIDGE_PACKET_MAP			2
 #define BRIDGE_PACKET_SABER			3
 #define BRIDGE_PACKET_RENDER		4
+#define BRIDGE_PACKET_NPC			5
 
 // Common header is 20 bytes. Sizes include that header.
 // Type 1 and type 2 layouts are frozen. New packets use a new type.
@@ -52,6 +53,19 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #define BRIDGE_RENDER_PACKET_SIZE	228
 #define BRIDGE_RENDER_HAND_R		0x01u
 #define BRIDGE_RENDER_HAND_L		0x02u
+
+// Type 5. Header is the shared 20 bytes. At most 10 entries per datagram.
+#define BRIDGE_HEADER_SIZE			20
+#define BRIDGE_NPC_ENTRY_SIZE		100
+#define BRIDGE_NPC_MAX_PER_PACKET	10
+#define BRIDGE_NPC_PACKET_MAX		1028
+#define BRIDGE_NPC_NAME_LEN			32
+#define BRIDGE_NPC_NEW				0x01u
+#define BRIDGE_NPC_WEAPON			0x02u
+#define BRIDGE_NPC_SABER			0x04u
+#define BRIDGE_NPC_ALIVE			0
+#define BRIDGE_NPC_DYING			1
+#define BRIDGE_NPC_DEAD				2
 
 #define BRIDGE_DEFAULT_PORT			"27420"
 

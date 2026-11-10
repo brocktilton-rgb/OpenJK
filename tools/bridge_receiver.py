@@ -23,10 +23,13 @@ PACKET_POSE = 1
 PACKET_MAP = 2
 PACKET_SABER = 3
 PACKET_RENDER = 4
+PACKET_NPC = 5
 POSE_SIZE = 160
 MAP_SIZE = 84
 SABER_SIZE = 672
 RENDER_SIZE = 228
+NPC_ENTRY_SIZE = 100
+NPC_MAX_PER_PACKET = 10
 MAP_NAME_LEN = 64
 HILT_NAME_LEN = 64
 SABER_BLADE_SLOTS = 16
@@ -174,6 +177,38 @@ def decode_packet(buf: bytes) -> dict:
         header["hand_r"] = _read_hand(buf, 132)
         header["hand_l"] = _read_hand(buf, 180)
         return header
+    if kind == PACKET_NPC:
+        if len(buf) < 28:
+            raise PacketError("short npc packet (%d)" % len(buf))
+        count = _u16(buf, 20)
+        if count > NPC_MAX_PER_PACKET or len(buf) < 28 + count * NPC_ENTRY_SIZE:
+            raise PacketError("bad npc packet count %d (%d bytes)" % (count, len(buf)))
+        header["npc_count"] = count
+        header["npc_total"] = _u16(buf, 22)
+        header["npc_index"] = buf[24]
+        header["npc_packets"] = buf[25]
+        npcs = []
+        for index in range(count):
+            off = 28 + index * NPC_ENTRY_SIZE
+            name = buf[off + 68:off + 100].split(b"\x00", 1)[0].decode("ascii", "replace")
+            npcs.append({
+                "entity": _u16(buf, off),
+                "state": buf[off + 2],
+                "flags": buf[off + 3],
+                "type_hash": _u32(buf, off + 4),
+                "origin": _vec3(buf, off + 8),
+                "angles": _vec3(buf, off + 20),
+                "legs_anim": _i32(buf, off + 32),
+                "torso_anim": _i32(buf, off + 36),
+                "legs_frame": _f32(buf, off + 40),
+                "torso_frame": _f32(buf, off + 44),
+                "weapon": _i32(buf, off + 48),
+                "health": _i32(buf, off + 52),
+                "velocity": _vec3(buf, off + 56),
+                "npc_type": name,
+            })
+        header["npcs"] = npcs
+        return header
     header["skipped"] = True
     return header
 
@@ -298,6 +333,27 @@ def format_packet(packet: dict, verbose: bool) -> str:
                 _fmt_vec(packet["hand_l"]["origin"]),
             )
         return line
+    if packet["type"] == PACKET_NPC:
+        lines = [
+            "npc seq=%d frame=%d t=%d part=%d/%d count=%d total=%d"
+            % (
+                packet["sequence"],
+                packet["frame"],
+                packet["server_time"],
+                packet["npc_index"] + 1,
+                packet["npc_packets"],
+                packet["npc_count"],
+                packet["npc_total"],
+            )
+        ]
+        states = ("alive", "dying", "dead")
+        for npc in packet["npcs"]:
+            state = states[npc["state"]] if npc["state"] < len(states) else str(npc["state"])
+            lines.append(
+                "  ent=%d %s %s hp=%d weap=%d org=%s"
+                % (npc["entity"], npc["npc_type"] or '""', state, npc["health"], npc["weapon"], _fmt_vec(npc["origin"]))
+            )
+        return "\n".join(lines)
     if packet["type"] == PACKET_MAP:
         return "map  seq=%d frame=%d t=%d name=%s" % (
             packet["sequence"], packet["frame"], packet["server_time"], packet["map_name"] or '""'
@@ -501,6 +557,19 @@ def self_test() -> int:
     assert render["hand_r"]["origin"] == (10.0, 0.0, 40.0)
     assert render["hand_r"]["axis_y"] == (0.0, -1.0, 0.0)
     assert render["hand_l"]["origin"] == (-10.0, 0.0, 40.0)
+
+    npc_buf = bytearray(28 + NPC_ENTRY_SIZE)
+    struct.pack_into("<4sHHIIi", npc_buf, 0, MAGIC, VERSION, PACKET_NPC, 12, 42, 1700)
+    struct.pack_into("<HHBBH", npc_buf, 20, 1, 1, 0, 1, 0)
+    struct.pack_into("<HBBI", npc_buf, 28, 17, 0, 0x02, 0x811C9DC5)
+    struct.pack_into("<3f3f", npc_buf, 36, 8, 9, 10, 0, 180, 0)
+    struct.pack_into("<iiffii3f", npc_buf, 60, 4, 5, 1.5, 2.5, 3, 40, 1, 0, 0)
+    npc_buf[28 + 68:28 + 74] = b"rodian"
+    npc = decode_packet(bytes(npc_buf))
+    assert npc["npc_count"] == 1 and npc["npc_total"] == 1
+    assert npc["npcs"][0]["entity"] == 17 and npc["npcs"][0]["npc_type"] == "rodian"
+    assert npc["npcs"][0]["origin"] == (8.0, 9.0, 10.0)
+    assert npc["npcs"][0]["health"] == 40
     # Type 1 and type 2 still decode after a type 3 packet, and unknown types are skipped.
     assert decode_packet(_pack_pose())["type"] == PACKET_POSE
     unknown = bytearray(24)

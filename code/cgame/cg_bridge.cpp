@@ -45,6 +45,10 @@ static uint32_t		s_sentPose = 0;
 static uint32_t		s_sentMap = 0;
 static uint32_t		s_sentSaber = 0;
 static uint32_t		s_sentRender = 0;
+static uint32_t		s_sentNpc = 0;
+static vmCvar_t		bridge_npc_radius;
+static unsigned char	s_npcWasHere[MAX_GENTITIES];
+static int			s_npcLastFlags[MAX_GENTITIES];
 static uint32_t		s_sendDrops = 0;
 static uint32_t		s_sendFails = 0;
 static int			s_lastPoseMs = 0;
@@ -193,6 +197,8 @@ static void Bridge_Send( const uint8_t *packet, int size )
 			s_sentSaber++;
 		} else if ( type == BRIDGE_PACKET_RENDER ) {
 			s_sentRender++;
+		} else if ( type == BRIDGE_PACKET_NPC ) {
+			s_sentNpc++;
 		}
 		s_lastSendError[0] = '\0';
 		Bridge_ClearComplain();
@@ -642,6 +648,195 @@ static void Bridge_SendRender( const playerState_t *ps, centity_t *cent, uint32_
 	Bridge_Send( packet, BRIDGE_RENDER_PACKET_SIZE );
 }
 
+#ifndef ANIM_TOGGLEBIT
+#define ANIM_TOGGLEBIT 2048
+#endif
+
+static uint32_t Bridge_Fnv1a32Lower( const char *text )
+{
+	uint32_t hash = 2166136261u;
+	const unsigned char *s;
+
+	if ( !text ) {
+		return hash;
+	}
+	for ( s = (const unsigned char *)text; *s; ++s ) {
+		unsigned char c = *s;
+		if ( c >= 'A' && c <= 'Z' ) {
+			c = (unsigned char)( c + ( 'a' - 'A' ) );
+		}
+		hash ^= c;
+		hash *= 16777619u;
+	}
+	return hash;
+}
+
+static int Bridge_NpcState( int health, int legsAnim )
+{
+	if ( health > 0 ) {
+		return BRIDGE_NPC_ALIVE;
+	}
+	if ( legsAnim >= BOTH_DEATH1 && legsAnim < BOTH_DEAD1 ) {
+		return BRIDGE_NPC_DYING;
+	}
+	return BRIDGE_NPC_DEAD;
+}
+
+static uint8_t *Bridge_WriteNpc( uint8_t *p, int entityNum )
+{
+	gentity_t *gent = &g_entities[entityNum];
+	centity_t *cent = &cg_entities[entityNum];
+	int weapon = cent->currentState.weapon;
+	int legsAnim = cent->currentState.legsAnim;
+	int torsoAnim = cent->currentState.torsoAnim;
+	int health = gent->health;
+	unsigned int flags = 0;
+	uint8_t *start = p;
+	char name[BRIDGE_NPC_NAME_LEN];
+
+	if ( gent->client ) {
+		weapon = gent->client->ps.weapon;
+		legsAnim = gent->client->ps.legsAnim;
+		torsoAnim = gent->client->ps.torsoAnim;
+	}
+	legsAnim &= ~ANIM_TOGGLEBIT;
+	torsoAnim &= ~ANIM_TOGGLEBIT;
+
+	if ( !s_npcWasHere[entityNum] || ( ( cent->currentState.eFlags ^ s_npcLastFlags[entityNum] ) & EF_TELEPORT_BIT ) ) {
+		flags |= BRIDGE_NPC_NEW;
+	}
+	if ( weapon != WP_NONE ) {
+		flags |= BRIDGE_NPC_WEAPON;
+	}
+	if ( cent->currentState.saberActive || ( gent->client && gent->client->ps.SaberActive() ) ) {
+		flags |= BRIDGE_NPC_SABER;
+	}
+
+	memset( name, 0, sizeof( name ) );
+	if ( gent->NPC_type && gent->NPC_type[0] ) {
+		Q_strncpyz( name, gent->NPC_type, sizeof( name ) );
+	}
+
+	p = Bridge_WriteU16( p, (unsigned int)entityNum );
+	p = Bridge_WriteU8( p, (unsigned int)Bridge_NpcState( health, legsAnim ) );
+	p = Bridge_WriteU8( p, flags );
+	p = Bridge_WriteU32( p, Bridge_Fnv1a32Lower( name ) );
+	p = Bridge_WriteVec3( p, cent->lerpOrigin );
+	p = Bridge_WriteVec3( p, cent->lerpAngles );
+	p = Bridge_WriteI32( p, legsAnim );
+	p = Bridge_WriteI32( p, torsoAnim );
+	p = Bridge_WriteF32( p, Bridge_RenderedFrame( cent, gent->rootBone, &cent->pe.legs ) );
+	p = Bridge_WriteF32( p, Bridge_RenderedFrame( cent, gent->lowerLumbarBone, &cent->pe.torso ) );
+	p = Bridge_WriteI32( p, weapon );
+	p = Bridge_WriteI32( p, health );
+	p = Bridge_WriteVec3( p, cent->currentState.pos.trDelta );
+	memcpy( p, name, BRIDGE_NPC_NAME_LEN );
+	p += BRIDGE_NPC_NAME_LEN;
+
+	if ( (int)( p - start ) != BRIDGE_NPC_ENTRY_SIZE ) {
+		return start;
+	}
+	return p;
+}
+
+static void Bridge_SendNpcs( uint32_t frame, int serverTime )
+{
+	int ids[MAX_GENTITIES];
+	unsigned char here[MAX_GENTITIES];
+	int total = 0;
+	int i;
+	int playerNum;
+	float radius;
+	float radiusSq;
+	int packetCount;
+	int packetIndex;
+	uint32_t seq;
+
+	static_assert( BRIDGE_HEADER_SIZE == 20, "bridge header size" );
+	static_assert( BRIDGE_NPC_ENTRY_SIZE == 100, "npc entry size" );
+	static_assert( BRIDGE_NPC_PACKET_MAX == 1028, "npc packet max" );
+	static_assert( BRIDGE_HEADER_SIZE + 8 + BRIDGE_NPC_ENTRY_SIZE * BRIDGE_NPC_MAX_PER_PACKET == BRIDGE_NPC_PACKET_MAX, "npc packet math" );
+
+	if ( !cg.snap ) {
+		return;
+	}
+	cgi_Cvar_Update( &bridge_npc_radius );
+	radius = bridge_npc_radius.value;
+	if ( radius < 0.0f ) {
+		radius = 0.0f;
+	}
+	radiusSq = radius * radius;
+	playerNum = cg.snap->ps.clientNum;
+	memset( here, 0, sizeof( here ) );
+
+	for ( i = 0; i < cg.snap->numEntities; ++i ) {
+		int num = cg.snap->entities[i].number;
+		gentity_t *gent;
+		centity_t *cent;
+		vec3_t delta;
+
+		if ( num < 0 || num >= MAX_GENTITIES || num == playerNum ) {
+			continue;
+		}
+		gent = &g_entities[num];
+		if ( !gent->inuse || ( !gent->NPC && !gent->client ) ) {
+			continue;
+		}
+		cent = &cg_entities[num];
+		if ( radius > 0.0f ) {
+			VectorSubtract( cent->lerpOrigin, cg.refdef.vieworg, delta );
+			if ( VectorLengthSquared( delta ) > radiusSq ) {
+				continue;
+			}
+		}
+		ids[total++] = num;
+		here[num] = 1;
+	}
+
+	packetCount = total > 0 ? ( total + BRIDGE_NPC_MAX_PER_PACKET - 1 ) / BRIDGE_NPC_MAX_PER_PACKET : 1;
+	seq = s_sequence++;
+	for ( packetIndex = 0; packetIndex < packetCount; ++packetIndex ) {
+		uint8_t packet[BRIDGE_NPC_PACKET_MAX];
+		uint8_t *p;
+		int begin = packetIndex * BRIDGE_NPC_MAX_PER_PACKET;
+		int count = total - begin;
+		int n;
+
+		if ( count > BRIDGE_NPC_MAX_PER_PACKET ) {
+			count = BRIDGE_NPC_MAX_PER_PACKET;
+		}
+		if ( count < 0 ) {
+			count = 0;
+		}
+		memset( packet, 0, sizeof( packet ) );
+		p = Bridge_WriteHeader( packet, BRIDGE_PACKET_NPC, seq, frame, serverTime );
+		p = Bridge_WriteU16( p, (unsigned int)count );
+		p = Bridge_WriteU16( p, (unsigned int)total );
+		p = Bridge_WriteU8( p, (unsigned int)packetIndex );
+		p = Bridge_WriteU8( p, (unsigned int)packetCount );
+		p = Bridge_WriteU16( p, 0 );
+		for ( n = 0; n < count; ++n ) {
+			uint8_t *next = Bridge_WriteNpc( p, ids[begin + n] );
+			if ( next == p ) {
+				Bridge_Complain( "npc entry size mismatch" );
+				return;
+			}
+			p = next;
+		}
+		if ( (int)( p - packet ) != BRIDGE_HEADER_SIZE + 8 + count * BRIDGE_NPC_ENTRY_SIZE ) {
+			Bridge_Complain( "npc packet size mismatch" );
+			return;
+		}
+		Bridge_Send( packet, (int)( p - packet ) );
+	}
+
+	for ( i = 0; i < total; ++i ) {
+		int num = ids[i];
+		s_npcLastFlags[num] = cg_entities[num].currentState.eFlags;
+	}
+	memcpy( s_npcWasHere, here, sizeof( s_npcWasHere ) );
+}
+
 void Bridge_Init( void )
 {
 	if ( s_inited ) {
@@ -652,6 +847,7 @@ void Bridge_Init( void )
 	cgi_Cvar_Register( &bridge_host, "bridge_host", "127.0.0.1", CVAR_ARCHIVE );
 	cgi_Cvar_Register( &bridge_port, "bridge_port", BRIDGE_DEFAULT_PORT, CVAR_ARCHIVE );
 	cgi_Cvar_Register( &bridge_rate, "bridge_rate", "0", CVAR_ARCHIVE );
+	cgi_Cvar_Register( &bridge_npc_radius, "bridge_npc_radius", "4096", CVAR_ARCHIVE );
 	cgi_AddCommand( "bridge_status" );
 	s_inited = qtrue;
 }
@@ -682,8 +878,8 @@ qboolean Bridge_ConsoleCommand( void )
 	CG_Printf( "  streaming: %s\n", s_streaming ? "yes" : "no" );
 	CG_Printf( "  target: %s:%d\n", bridge_host.string, bridge_port.integer );
 	CG_Printf( "  rate: %d%s\n", rate, rate ? "" : " (every frame)" );
-	CG_Printf( "  packets sent: pose %u, map %u, saber %u, render %u (dropped %u, failed %u)\n",
-		s_sentPose, s_sentMap, s_sentSaber, s_sentRender, s_sendDrops, s_sendFails );
+	CG_Printf( "  packets sent: pose %u, map %u, saber %u, render %u, npc %u (dropped %u, failed %u)\n",
+		s_sentPose, s_sentMap, s_sentSaber, s_sentRender, s_sentNpc, s_sendDrops, s_sendFails );
 	CG_Printf( "  last send error: %s\n", s_lastSendError[0] ? s_lastSendError : "none" );
 	if ( !s_streaming && s_lastComplain[0] ) {
 		CG_Printf( "  not streaming: %s\n", s_lastComplain );
@@ -702,6 +898,8 @@ void Bridge_Shutdown( void )
 	s_lastComplain[0] = '\0';
 	s_haveOrigin = qfalse;
 	s_originSnapTime = 0;
+	memset( s_npcWasHere, 0, sizeof( s_npcWasHere ) );
+	memset( s_npcLastFlags, 0, sizeof( s_npcLastFlags ) );
 }
 
 void Bridge_Frame( int stereoView )
@@ -782,4 +980,5 @@ void Bridge_Frame( int stereoView )
 	Bridge_SendPose( (uint32_t)cg.clientFrame, cg.time );
 	Bridge_MaybeSendSaber( &cg.predicted_player_state, &cg_entities[0], (uint32_t)cg.clientFrame, cg.time );
 	Bridge_SendRender( &cg.predicted_player_state, &cg_entities[0], (uint32_t)cg.clientFrame, cg.time );
+	Bridge_SendNpcs( (uint32_t)cg.clientFrame, cg.time );
 }
