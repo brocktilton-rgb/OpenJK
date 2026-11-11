@@ -33,6 +33,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #define BRIDGE_PACKET_SABER			3
 #define BRIDGE_PACKET_RENDER		4
 #define BRIDGE_PACKET_NPC			5
+#define BRIDGE_PACKET_HUD			6
 
 // Common header is 20 bytes. Sizes include that header.
 // Type 1 and type 2 layouts are frozen. New packets use a new type.
@@ -78,6 +79,8 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #define BRIDGE_NPC_ALIVE			0
 #define BRIDGE_NPC_DYING			1
 #define BRIDGE_NPC_DEAD				2
+
+#define BRIDGE_HUD_PACKET_SIZE		56
 
 #define BRIDGE_DEFAULT_PORT			"27420"
 

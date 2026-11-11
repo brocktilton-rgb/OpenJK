@@ -46,6 +46,7 @@ static uint32_t		s_sentMap = 0;
 static uint32_t		s_sentSaber = 0;
 static uint32_t		s_sentRender = 0;
 static uint32_t		s_sentNpc = 0;
+static uint32_t		s_sentHud = 0;
 static vmCvar_t		bridge_npc_radius;
 static unsigned char	s_npcWasHere[MAX_GENTITIES];
 static int			s_npcLastFlags[MAX_GENTITIES];
@@ -207,6 +208,8 @@ static void Bridge_Send( const uint8_t *packet, int size )
 			s_sentRender++;
 		} else if ( type == BRIDGE_PACKET_NPC ) {
 			s_sentNpc++;
+		} else if ( type == BRIDGE_PACKET_HUD ) {
+			s_sentHud++;
 		}
 		s_lastSendError[0] = '\0';
 		Bridge_ClearComplain();
@@ -942,6 +945,49 @@ static void Bridge_SendNpcs( uint32_t frame, int serverTime )
 	memcpy( s_npcWasHere, here, sizeof( s_npcWasHere ) );
 }
 
+static void Bridge_SendHud( uint32_t frame, int serverTime )
+{
+	const playerState_t *ps;
+	uint8_t packet[BRIDGE_HUD_PACKET_SIZE];
+	uint8_t *p;
+	int weapon;
+	int ammo = -1;
+	int ammoMax = 0;
+	int ammoIndex;
+
+	static_assert( BRIDGE_HUD_PACKET_SIZE == 56, "hud packet size" );
+
+	if ( !cg.snap ) {
+		return;
+	}
+	ps = &cg.snap->ps;
+	weapon = ps->weapon;
+	if ( weapon >= 0 && weapon < WP_NUM_WEAPONS ) {
+		ammoIndex = weaponData[weapon].ammoIndex;
+		if ( ammoIndex != AMMO_NONE && ammoIndex >= 0 && ammoIndex < AMMO_MAX && ammoIndex < MAX_AMMO ) {
+			ammo = ps->ammo[ammoIndex];
+			ammoMax = ammoData[ammoIndex].max;
+		}
+	}
+
+	memset( packet, 0, sizeof( packet ) );
+	p = Bridge_WriteHeader( packet, BRIDGE_PACKET_HUD, s_sequence++, frame, serverTime );
+	p = Bridge_WriteI32( p, ps->stats[STAT_HEALTH] );
+	p = Bridge_WriteI32( p, ps->stats[STAT_MAX_HEALTH] );
+	p = Bridge_WriteI32( p, ps->stats[STAT_ARMOR] );
+	p = Bridge_WriteI32( p, ps->forcePower );
+	p = Bridge_WriteI32( p, ps->forcePowerMax );
+	p = Bridge_WriteI32( p, ps->saberAnimLevel );
+	p = Bridge_WriteI32( p, weapon );
+	p = Bridge_WriteI32( p, ammo );
+	p = Bridge_WriteI32( p, ammoMax );
+	if ( (int)( p - packet ) != BRIDGE_HUD_PACKET_SIZE ) {
+		Bridge_Complain( "hud packet size mismatch" );
+		return;
+	}
+	Bridge_Send( packet, BRIDGE_HUD_PACKET_SIZE );
+}
+
 void Bridge_Init( void )
 {
 	if ( s_inited ) {
@@ -983,8 +1029,8 @@ qboolean Bridge_ConsoleCommand( void )
 	CG_Printf( "  streaming: %s\n", s_streaming ? "yes" : "no" );
 	CG_Printf( "  target: %s:%d\n", bridge_host.string, bridge_port.integer );
 	CG_Printf( "  rate: %d%s\n", rate, rate ? "" : " (every frame)" );
-	CG_Printf( "  packets sent: pose %u, map %u, saber %u, render %u, npc %u (dropped %u, failed %u)\n",
-		s_sentPose, s_sentMap, s_sentSaber, s_sentRender, s_sentNpc, s_sendDrops, s_sendFails );
+	CG_Printf( "  packets sent: pose %u, map %u, saber %u, render %u, npc %u, hud %u (dropped %u, failed %u)\n",
+		s_sentPose, s_sentMap, s_sentSaber, s_sentRender, s_sentNpc, s_sentHud, s_sendDrops, s_sendFails );
 	CG_Printf( "  last send error: %s\n", s_lastSendError[0] ? s_lastSendError : "none" );
 	if ( !s_streaming && s_lastComplain[0] ) {
 		CG_Printf( "  not streaming: %s\n", s_lastComplain );
@@ -1109,4 +1155,5 @@ void Bridge_Frame( int stereoView )
 	Bridge_MaybeSendSaber( &cg.predicted_player_state, &cg_entities[0], (uint32_t)cg.clientFrame, cg.time );
 	Bridge_SendRender( &cg.predicted_player_state, &cg_entities[0], (uint32_t)cg.clientFrame, cg.time );
 	Bridge_SendNpcs( (uint32_t)cg.clientFrame, cg.time );
+	Bridge_SendHud( (uint32_t)cg.clientFrame, cg.time );
 }

@@ -362,6 +362,23 @@ Each entry:
 | 212 | 32 | char[32] | hilt name (`saber[0].name`, empty if none) |
 | 244 | 4 | int32 | `cg.time` of the latest fire event, 0 if none |
 
+### HUD packet (type 6, 56 bytes, header version 1)
+
+Sent on the same samples as the other bridge packets, under `bridge_rate`. Skipped when `cg.snap` is null. Every value is an int32 from `cg.snap->ps`.
+
+| Offset | Type | Field |
+| ---: | --- | --- |
+| 0 | header | type = 6, version = 1 |
+| 20 | int32 | health, `stats[STAT_HEALTH]` |
+| 24 | int32 | max health, `stats[STAT_MAX_HEALTH]` |
+| 28 | int32 | armor, `stats[STAT_ARMOR]` |
+| 32 | int32 | `forcePower` |
+| 36 | int32 | `forcePowerMax` |
+| 40 | int32 | `saberAnimLevel` |
+| 44 | int32 | `weapon` |
+| 48 | int32 | ammo, `ammo[weaponData[weapon].ammoIndex]`, or -1 when that index is `AMMO_NONE` or the weapon is out of range |
+| 52 | int32 | `ammoData[ammoIndex].max`, or 0 for `AMMO_NONE` |
+
 Hand matrices use the same `G2API_GetBoltMatrix` call as type 4: the NPC ghoul2 model, `handRBolt` / `handLBolt`, `lerpOrigin` (plus the model-scale Z nudge), and yaw from `renderAngles`. Axis order is the same columns: +X, +Y, +Z, in **+X forward, +Y left, +Z up** world units.
 
 Windows install, launch, and checks are in the sections above. To point the stream at another machine, set `bridge_host` to that machine's numeric IPv4 address and run the receiver with `--host 0.0.0.0`.

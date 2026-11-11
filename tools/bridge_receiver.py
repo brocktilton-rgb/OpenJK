@@ -24,6 +24,7 @@ PACKET_MAP = 2
 PACKET_SABER = 3
 PACKET_RENDER = 4
 PACKET_NPC = 5
+PACKET_HUD = 6
 POSE_SIZE = 160
 MAP_SIZE = 84
 SABER_SIZE = 672
@@ -32,6 +33,7 @@ NPC_ENTRY_SIZE = 100
 NPC_ENTRY_SIZE_V2 = 248
 NPC_MAX_PER_PACKET = 10
 NPC_MAX_PER_PACKET_V2 = 5
+HUD_SIZE = 56
 MAP_NAME_LEN = 64
 HILT_NAME_LEN = 64
 SABER_BLADE_SLOTS = 16
@@ -225,6 +227,16 @@ def decode_packet(buf: bytes) -> dict:
             npcs.append(npc)
         header["npcs"] = npcs
         return header
+    if kind == PACKET_HUD:
+        if len(buf) < HUD_SIZE:
+            raise PacketError("short hud packet (%d < %d)" % (len(buf), HUD_SIZE))
+        names = (
+            "health", "max_health", "armor", "force", "force_max",
+            "saber_style", "weapon", "ammo", "ammo_max",
+        )
+        values = struct.unpack_from("<9i", buf, 20)
+        header.update(zip(names, values))
+        return header
     header["skipped"] = True
     return header
 
@@ -370,6 +382,16 @@ def format_packet(packet: dict, verbose: bool) -> str:
                 % (npc["entity"], npc["npc_type"] or '""', state, npc["health"], npc["weapon"], _fmt_vec(npc["origin"]))
             )
         return "\n".join(lines)
+    if packet["type"] == PACKET_HUD:
+        return (
+            "hud seq=%d frame=%d t=%d hp=%d/%d armor=%d force=%d/%d style=%d weapon=%d ammo=%d/%d"
+            % (
+                packet["sequence"], packet["frame"], packet["server_time"],
+                packet["health"], packet["max_health"], packet["armor"],
+                packet["force"], packet["force_max"], packet["saber_style"],
+                packet["weapon"], packet["ammo"], packet["ammo_max"],
+            )
+        )
     if packet["type"] == PACKET_MAP:
         return "map  seq=%d frame=%d t=%d name=%s" % (
             packet["sequence"], packet["frame"], packet["server_time"], packet["map_name"] or '""'
@@ -609,6 +631,14 @@ def self_test() -> int:
     assert parsed["npcs"][0]["blade_color"] == (4, 0)
     assert parsed["npcs"][0]["hilt"] == "Kyle"
     assert parsed["npcs"][0]["last_fire_time"] == 1700
+
+    hud_buf = bytearray(HUD_SIZE)
+    struct.pack_into("<4sHHIIi", hud_buf, 0, MAGIC, VERSION, PACKET_HUD, 13, 42, 1800)
+    struct.pack_into("<9i", hud_buf, 20, 80, 100, 25, 50, 100, 2, 6, 30, 300)
+    hud = decode_packet(bytes(hud_buf))
+    assert hud["health"] == 80 and hud["max_health"] == 100 and hud["armor"] == 25
+    assert hud["force"] == 50 and hud["force_max"] == 100
+    assert hud["weapon"] == 6 and hud["ammo"] == 30 and hud["ammo_max"] == 300
     # Type 1 and type 2 still decode after a type 3 packet, and unknown types are skipped.
     assert decode_packet(_pack_pose())["type"] == PACKET_POSE
     unknown = bytearray(24)
