@@ -31,7 +31,7 @@ set(SPGameIncludeDirectories
 	)
 
 if(WIN32)
-	set(SPGameLibraries "winmm")
+	set(SPGameLibraries "winmm" "ws2_32")
 endif(WIN32)
 
 set(SPGameGameFiles
@@ -188,6 +188,8 @@ source_group("game" FILES ${SPGameGameFiles})
 set(SPGameFiles ${SPGameFiles} ${SPGameGameFiles})
 
 set(SPGameCGameFiles
+	"${SPDir}/cgame/cg_bridge.cpp"
+	"${SPDir}/cgame/cg_bridge_net.cpp"
 	"${SPDir}/cgame/cg_camera.cpp"
 	"${SPDir}/cgame/cg_consolecmds.cpp"
 	"${SPDir}/cgame/cg_credits.cpp"
@@ -230,6 +232,8 @@ set(SPGameCGameFiles
 	"${SPDir}/cgame/FxSystem.cpp"
 	"${SPDir}/cgame/FxTemplate.cpp"
 	"${SPDir}/cgame/FxUtil.cpp"
+	"${SPDir}/cgame/cg_bridge.h"
+	"${SPDir}/cgame/cg_bridge_net.h"
 	"${SPDir}/cgame/cg_camera.h"
 	"${SPDir}/cgame/animtable.h"
 	"${SPDir}/cgame/cg_headers.h"
