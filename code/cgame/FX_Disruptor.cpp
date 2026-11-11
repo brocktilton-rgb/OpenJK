@@ -26,6 +26,8 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 
 #include "cg_media.h"
 #include "FxScheduler.h"
+#include "cg_bridge.h"
+#include "../game/weapons.h"
 
 
 /*
@@ -37,6 +39,7 @@ static vec3_t WHITE	={1.0f,1.0f,1.0f};
 
 void FX_DisruptorMainShot( vec3_t start, vec3_t end )
 {
+	Bridge_NoteBeam( WP_DISRUPTOR, start, end, qfalse );
 	FX_AddLine( -1, start, end, 0.1f, 4.0f, 0.0f,
 							1.0f, 0.0f, 0.0f,
 							WHITE, WHITE, 0.0f,
@@ -52,6 +55,7 @@ FX_DisruptorAltShot
 */
 void FX_DisruptorAltShot( vec3_t start, vec3_t end, qboolean fullCharge )
 {
+	Bridge_NoteBeam( WP_DISRUPTOR, start, end, qtrue );
 	FX_AddLine( -1, start, end, 0.1f, 10.0f, 0.0f,
 							1.0f, 0.0f, 0.0f,
 							WHITE, WHITE, 0.0f,
@@ -101,6 +105,7 @@ FX_KothosBeam
 */
 void FX_KothosBeam( vec3_t start, vec3_t end )
 {
+	Bridge_NoteBeam( WP_NONE, start, end, qfalse );
 	FX_AddLine( -1, start, end, 0.1f, 10.0f, 0.0f,
 							1.0f, 0.0f, 0.0f,
 							WHITE, WHITE, 0.0f,

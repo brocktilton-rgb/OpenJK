@@ -21,6 +21,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 */
 
 #include "common_headers.h"
+#include "cg_bridge.h"
 
 
 #if !defined(FX_SCHEDULER_H_INC)
@@ -485,7 +486,13 @@ int CFxScheduler::RegisterEffect( const char *path, bool bHasCorrectPath /*= fal
 		}
 	}
 	// Lets convert the effect file into something that we can work with
-	return ParseEffect( filenameNoExt, parser.GetBaseParseGroup() );
+	{
+		int handle = ParseEffect( filenameNoExt, parser.GetBaseParseGroup() );
+		if ( handle > 0 ) {
+			Bridge_RememberEffect( handle, pfile );
+		}
+		return handle;
+	}
 }
 
 
@@ -860,6 +867,18 @@ void CFxScheduler::PlayEffect( const char *file, int clientID, bool isPortal )
 
 	// Don't bother scheduling the effect if the system is currently frozen
 
+	{
+		vec3_t org;
+		vec3_t fwd;
+		VectorClear( org );
+		VectorClear( fwd );
+		if ( clientID >= 0 && clientID < MAX_GENTITIES ) {
+			VectorCopy( cg_entities[clientID].lerpOrigin, org );
+			AngleVectors( cg_entities[clientID].lerpAngles, fwd, NULL, NULL );
+		}
+		Bridge_NoteEffect( id, org, fwd, clientID, -1 );
+	}
+
 	// Get the effect.
 	fx = &mEffectTemplates[id];
 
@@ -1154,6 +1173,11 @@ void CFxScheduler::PlayEffect( int id, vec3_t origin, vec3_t axis[3], const int 
 		}
 	}
 
+	if ( axis ) {
+		Bridge_NoteEffect( id, origin, axis[0], entityNum, boltNum );
+	} else {
+		Bridge_NoteEffect( id, origin, NULL, entityNum, boltNum );
+	}
 
 	// Get the effect.
 	fx = &mEffectTemplates[id];

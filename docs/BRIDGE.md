@@ -96,7 +96,7 @@ A client that only reads type 1 will still see the body step about 20 times a se
 ## Not done yet
 
 1. Level meshes are exported by `tools/bsp2gltf`, not by the UDP stream. Unreal still has to load that glTF.
-2. NPCs are type 5 and movers are type 7. Other entity kinds are not sent.
+2. NPCs are type 5, movers are type 7, and missiles, effects, and one-shot sounds are type 8. Other entity kinds are not sent.
 3. Saber packets are in this build, but the Unreal saber picture was not checked, because that part of the editor is not hooked up yet.
 4. A list of hilt names (`saberInfo_t::name` values such as `Kyle`) is planned as `tools/list_saber_hilts.py`. That script is not in this branch.
 5. On GitHub, the macOS arm64 jobs and the Ubuntu Debug job have failed or been cancelled because the runner never started or the job hit the time limit. That is the build service, not this code. The job that matters for the Windows test is **Windows x86_64 Release (Non-Portable)**.
@@ -129,7 +129,7 @@ All four are archived. The default is off.
 | `bridge_enable` | `0` | `1` streams. `0` closes the socket. |
 | `bridge_host` | `127.0.0.1` | Numeric IPv4 only. Hostnames are rejected so the game cannot block in DNS. |
 | `bridge_port` | `27420` | UDP destination port. |
-| `bridge_rate` | `0` | Maximum samples per second, using client realtime. `0` sends every rendered frame. Clamped to 480. The interval is `1000 / rate` milliseconds. A sample is the map packet (when one is due), the pose packet, the saber packet when a lightsaber is out, the render packet, the NPC packets, the HUD packet, and the mover packets. |
+| `bridge_rate` | `0` | Maximum samples per second, using client realtime. `0` sends every rendered frame. Clamped to 480. The interval is `1000 / rate` milliseconds. A sample is the map packet (when one is due), the pose packet, the saber packet when a lightsaber is out, the render packet, the NPC packets, the HUD packet, the mover packets, and the event packets. |
 | `bridge_npc_radius` | `4096` | NPCs farther than this from the camera are left out of type 5. `0` means no limit. |
 
 Changing host or port reopens the socket on the next frame. A rejected host stops the stream until the value is a numeric IPv4 address again.
@@ -165,7 +165,7 @@ Each datagram is one packet. Readers that only know type 1 and type 2 drop any o
 | ---: | ---: | --- | --- |
 | 0 | 4 | char[4] | magic `OJB1` |
 | 4 | 2 | uint16 | version = 1 |
-| 6 | 2 | uint16 | type: `1` pose, `2` map, `3` saber, `4` render pose, `5` NPC, `6` HUD, `7` mover |
+| 6 | 2 | uint16 | type: `1` pose, `2` map, `3` saber, `4` render pose, `5` NPC, `6` HUD, `7` mover, `8` event |
 | 8 | 4 | uint32 | sequence |
 | 12 | 4 | uint32 | frame (`cg.clientFrame`) |
 | 16 | 4 | int32 | serverTime (`cg.time`, ms) |
@@ -419,6 +419,63 @@ Flags:
 | 0 | `0x01` | newly seen this frame, or `EF_TELEPORT_BIT` flipped |
 | 1 | `0x02` | moving: `pos.trType` or `apos.trType` is not `TR_STATIONARY` |
 | 2 | `0x04` | `EF_NODRAW` (the renderer skips the brush) |
+
+### Event packet (type 8, header version 1)
+
+Sent on the same samples as the other bridge packets, under the same `bridge_rate` cap. The game queues records during the frame and flushes them here. The queue holds 256 records. A record that does not fit increments `droppedRecords`, which is how many records were dropped since the previous event datagram. Each datagram carries at most 15 records. Further datagrams in the same flush have `droppedRecords` 0. An empty queue with nothing dropped sends no datagram.
+
+The body header is 8 bytes, so a full datagram is 28 + 15×80 = 1228 bytes. The 1224 figure counted a 4-byte body and left out `droppedRecords`.
+
+| Offset | Size | Type | Field |
+| ---: | ---: | --- | --- |
+| 0 | 20 | header | type = 8, version = 1 |
+| 20 | 2 | uint16 | `count` |
+| 22 | 2 | uint16 | reserved, 0 |
+| 24 | 4 | uint32 | `droppedRecords` |
+| 28 | 80 × count | records | at most 15 |
+
+Kinds 1, 2, and 3 share one record layout. Bytes 40–79 are zero.
+
+| Offset | Size | Type | Field |
+| ---: | ---: | --- | --- |
+| 0 | 1 | uint8 | kind: `1` missile, `2` effect, `3` sound |
+| 1 | 1 | uint8 | flags |
+| 2 | 2 | uint16 | entity number, or `0xFFFF` if none |
+| 4 | 4 | int32 | index |
+| 8 | 12 | float[3] | origin |
+| 20 | 12 | float[3] | vec |
+| 32 | 4 | int32 | extra |
+| 36 | 4 | int32 | `cg.time` |
+
+Kind 4 does not use origin, vec, extra, or time.
+
+| Offset | Size | Type | Field |
+| ---: | ---: | --- | --- |
+| 0 | 1 | uint8 | kind = 4 |
+| 1 | 1 | uint8 | table: `1` effect, `2` sound |
+| 2 | 2 | uint16 | `0xFFFF` |
+| 4 | 4 | int32 | effect id or sound handle |
+| 8 | 64 | char[64] | path, null-terminated |
+| 72 | 8 | bytes | zero |
+
+Missile flags: `0x01` first frame this entity was seen, `0x02` instant beam. Sound flags: `0x01` local (`cgi_S_StartLocalSound`), `0x02` origin was NULL so the sound is attached to `entityNum`.
+
+**Kind 1.** Every `ET_MISSILE` in `cg.snap` becomes one record. `index` is `weapon`. `origin` is `lerpOrigin`. `vec` is `pos.trDelta`. `extra` is 1 for alt fire: `EF_ALT_FIRING`, or `gentity_t::alt_fire` when that flag is not set on the missile. `entityNum` is the missile.
+
+Instant beams are not missiles. The SP client draws them with `FX_AddLine` from the shot start to the impact. Those are still kind 1, with `0x02` set, `origin` = start, `vec` = end, `entityNum` = `0xFFFF`.
+
+| Shot | Hook | `index` | `extra` |
+| --- | --- | --- | --- |
+| Disruptor main | `FX_DisruptorMainShot` | `WP_DISRUPTOR` | 0 |
+| Disruptor alt | `FX_DisruptorAltShot` | `WP_DISRUPTOR` | 1 |
+| Concussion alt | `FX_ConcAltShot` | `WP_CONCUSSION` | 1 |
+| Kothos beam | `FX_KothosBeam` | `WP_NONE` | 0 |
+
+**Kind 2.** `CFxScheduler::PlayEffect` is the choke point. The `int` id plus axis overload covers `CG_PlayEffect`, `CG_PlayEffectID`, and the other wrappers, because they all end there. The `file` plus `clientID` overload does not, so it is noted on its own. `index` is the id from `RegisterEffect`. `origin` is the play origin (for the client overload, `lerpOrigin`). `vec` is axis forward, or the angles' forward for the client overload. `entityNum` is the bolt's entity, the passed entity, or `0xFFFF`. `extra` is the Ghoul2 bolt, or -1 when it is not bolted.
+
+**Kind 3.** `cgi_S_StartSound` and `cgi_S_StartLocalSound` in `cg_syscalls.cpp`. Effect sounds go through `cgi_S_StartSound`, so they are included. `index` is the `sfxHandle`. `extra` is the channel. Looping sounds (`cgi_S_AddLoopingSound`) are not in this packet.
+
+**Kind 4.** The path is stored when `RegisterEffect` parses a file and when `cgi_S_RegisterSound` returns a handle. Effect paths are the file the scheduler opened, normally `effects/<name>.efx` inside the pk3 (`FX_FILE_PATH` is `effects`). Sound paths are the string passed to register, normally `sound/...wav` or `sound/...mp3`. The first time a kind 2 or 3 record uses an id that has a stored path, a kind 4 record is queued immediately. Each flush also appends up to 8 names, round-robin, so a client that connects late still receives the whole table. The table holds 1024 paths. Sound handles at or above 4096, and effect ids at or above 256, are still sent as kind 2 or 3 but have no kind 4 entry.
 
 Hand matrices use the same `G2API_GetBoltMatrix` call as type 4: the NPC ghoul2 model, `handRBolt` / `handLBolt`, `lerpOrigin` (plus the model-scale Z nudge), and yaw from `renderAngles`. Axis order is the same columns: +X, +Y, +Z, in **+X forward, +Y left, +Z up** world units.
 

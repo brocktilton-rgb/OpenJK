@@ -22,6 +22,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 */
 
 #include "cg_headers.h"
+#include "cg_bridge.h"
 
 // this file is only included when building a dll
 
@@ -185,6 +186,7 @@ void cgi_S_StopSounds( void )
 
 void	cgi_S_StartSound( const vec3_t origin, int entityNum, int entchannel, sfxHandle_t sfx ) {
 	Q_syscall( CG_S_STARTSOUND, origin, entityNum, entchannel, sfx );
+	Bridge_NoteSound( sfx, origin, entityNum, entchannel, qfalse );
 }
 
 void	cgi_AS_ParseSets( void ) {
@@ -209,6 +211,7 @@ sfxHandle_t cgi_AS_GetBModelSound( const char *name, int stage ) {
 
 void	cgi_S_StartLocalSound( sfxHandle_t sfx, int channelNum ) {
 	Q_syscall( CG_S_STARTLOCALSOUND, sfx, channelNum );
+	Bridge_NoteSound( sfx, NULL, -1, channelNum, qtrue );
 }
 
 void	cgi_S_ClearLoopingSounds( void ) {
@@ -228,7 +231,9 @@ void	cgi_S_Respatialize( int entityNum, const vec3_t origin, vec3_t axis[3], qbo
 }
 
 sfxHandle_t	cgi_S_RegisterSound( const char *sample ) {
-	return Q_syscall( CG_S_REGISTERSOUND, sample );
+	sfxHandle_t handle = Q_syscall( CG_S_REGISTERSOUND, sample );
+	Bridge_RememberSound( handle, sample );
+	return handle;
 }
 
 void	cgi_S_StartBackgroundTrack( const char *intro, const char *loop, qboolean bForceStart ) {

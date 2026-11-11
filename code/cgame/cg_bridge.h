@@ -35,6 +35,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #define BRIDGE_PACKET_NPC			5
 #define BRIDGE_PACKET_HUD			6
 #define BRIDGE_PACKET_MOVER			7
+#define BRIDGE_PACKET_EVENT			8
 
 // Common header is 20 bytes. Sizes include that header.
 // Type 1 and type 2 layouts are frozen. New packets use a new type.
@@ -92,6 +93,25 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #define BRIDGE_MOVER_MOVING			0x02u
 #define BRIDGE_MOVER_NODRAW			0x04u
 
+// Type 8. Header version 1. Body is count, reserved, droppedRecords (8 bytes),
+// then 80-byte records. 15 records: 28 + 1200 = 1228.
+#define BRIDGE_EVENT_RECORD_SIZE		80
+#define BRIDGE_EVENT_MAX_PER_PACKET		15
+#define BRIDGE_EVENT_PACKET_MAX			1228
+#define BRIDGE_EVENT_QUEUE				256
+#define BRIDGE_EVENT_NAMES_PER_FRAME	8
+#define BRIDGE_EVENT_MISSILE			1
+#define BRIDGE_EVENT_EFFECT				2
+#define BRIDGE_EVENT_SOUND				3
+#define BRIDGE_EVENT_NAME				4
+#define BRIDGE_EVENT_MISSILE_NEW		0x01u
+#define BRIDGE_EVENT_MISSILE_BEAM		0x02u
+#define BRIDGE_EVENT_SOUND_LOCAL		0x01u
+#define BRIDGE_EVENT_SOUND_ENTITY		0x02u
+#define BRIDGE_EVENT_NAME_EFFECT		1
+#define BRIDGE_EVENT_NAME_SOUND			2
+#define BRIDGE_EVENT_NONE				0xffffu
+
 #define BRIDGE_DEFAULT_PORT			"27420"
 
 #define BRIDGE_FLAG_THIRDPERSON		0x00000001u
@@ -105,5 +125,10 @@ void Bridge_Shutdown( void );
 void Bridge_Frame( int stereoView );
 qboolean Bridge_ConsoleCommand( void );
 void Bridge_NoteEntityEvent( int entityNum, int event );
+void Bridge_RememberEffect( int id, const char *path );
+void Bridge_RememberSound( int handle, const char *path );
+void Bridge_NoteEffect( int id, const vec3_t origin, const vec3_t dir, int entityNum, int bolt );
+void Bridge_NoteSound( int handle, const vec3_t origin, int entityNum, int channel, qboolean local );
+void Bridge_NoteBeam( int weapon, const vec3_t start, const vec3_t end, qboolean alt );
 
 #endif

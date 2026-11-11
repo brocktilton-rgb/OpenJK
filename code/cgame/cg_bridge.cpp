@@ -48,6 +48,7 @@ static uint32_t		s_sentRender = 0;
 static uint32_t		s_sentNpc = 0;
 static uint32_t		s_sentHud = 0;
 static uint32_t		s_sentMover = 0;
+static uint32_t		s_sentEvent = 0;
 static vmCvar_t		bridge_npc_radius;
 static unsigned char	s_npcWasHere[MAX_GENTITIES];
 static int			s_npcLastFlags[MAX_GENTITIES];
@@ -215,6 +216,8 @@ static void Bridge_Send( const uint8_t *packet, int size )
 			s_sentHud++;
 		} else if ( type == BRIDGE_PACKET_MOVER ) {
 			s_sentMover++;
+		} else if ( type == BRIDGE_PACKET_EVENT ) {
+			s_sentEvent++;
 		}
 		s_lastSendError[0] = '\0';
 		Bridge_ClearComplain();
@@ -1201,8 +1204,8 @@ qboolean Bridge_ConsoleCommand( void )
 	CG_Printf( "  streaming: %s\n", s_streaming ? "yes" : "no" );
 	CG_Printf( "  target: %s:%d\n", bridge_host.string, bridge_port.integer );
 	CG_Printf( "  rate: %d%s\n", rate, rate ? "" : " (every frame)" );
-	CG_Printf( "  packets sent: pose %u, map %u, saber %u, render %u, npc %u, hud %u, mover %u (dropped %u, failed %u)\n",
-		s_sentPose, s_sentMap, s_sentSaber, s_sentRender, s_sentNpc, s_sentHud, s_sentMover, s_sendDrops, s_sendFails );
+	CG_Printf( "  packets sent: pose %u, map %u, saber %u, render %u, npc %u, hud %u, mover %u, event %u (dropped %u, failed %u)\n",
+		s_sentPose, s_sentMap, s_sentSaber, s_sentRender, s_sentNpc, s_sentHud, s_sentMover, s_sentEvent, s_sendDrops, s_sendFails );
 	CG_Printf( "  last send error: %s\n", s_lastSendError[0] ? s_lastSendError : "none" );
 	if ( !s_streaming && s_lastComplain[0] ) {
 		CG_Printf( "  not streaming: %s\n", s_lastComplain );
@@ -1210,7 +1213,424 @@ qboolean Bridge_ConsoleCommand( void )
 	return qtrue;
 }
 
-void Bridge_Shutdown( void )
+#define BRIDGE_NAME_CAP			1024
+#define BRIDGE_SOUND_SLOTS		4096
+#define BRIDGE_EFFECT_SLOTS		256
+
+struct BridgeName {
+	int				index;
+	unsigned char	table;
+	unsigned char	announced;
+	unsigned char	queued;
+	char			path[MAX_QPATH];
+};
+
+struct BridgeEventRec {
+	unsigned char	kind;
+	unsigned char	flags;
+	unsigned short	entityNum;
+	int				index;
+	vec3_t			origin;
+	vec3_t			vec;
+	int				extra;
+	int				time;
+	char			path[MAX_QPATH];
+};
+
+static BridgeEventRec	s_events[BRIDGE_EVENT_QUEUE];
+static int				s_eventCount = 0;
+static uint32_t			s_eventDropped = 0;
+static BridgeName		s_names[BRIDGE_NAME_CAP];
+static int				s_nameCount = 0;
+static int				s_nameCursor = 0;
+static short			s_effectSlot[BRIDGE_EFFECT_SLOTS];
+static short			s_soundSlot[BRIDGE_SOUND_SLOTS];
+static qboolean			s_eventSlotsReady = qfalse;
+static unsigned char	s_missileWasHere[MAX_GENTITIES];
+
+static void Bridge_InitEventSlots( void )
+{
+	int i;
+
+	if ( s_eventSlotsReady ) {
+		return;
+	}
+	for ( i = 0; i < BRIDGE_EFFECT_SLOTS; ++i ) {
+		s_effectSlot[i] = -1;
+	}
+	for ( i = 0; i < BRIDGE_SOUND_SLOTS; ++i ) {
+		s_soundSlot[i] = -1;
+	}
+	s_eventSlotsReady = qtrue;
+}
+
+static void Bridge_ClearEventQueue( void )
+{
+	s_eventCount = 0;
+	s_eventDropped = 0;
+	memset( s_missileWasHere, 0, sizeof( s_missileWasHere ) );
+}
+
+static void Bridge_ClearNames( void )
+{
+	int i;
+
+	s_nameCount = 0;
+	s_nameCursor = 0;
+	if ( !s_eventSlotsReady ) {
+		return;
+	}
+	for ( i = 0; i < BRIDGE_EFFECT_SLOTS; ++i ) {
+		s_effectSlot[i] = -1;
+	}
+	for ( i = 0; i < BRIDGE_SOUND_SLOTS; ++i ) {
+		s_soundSlot[i] = -1;
+	}
+}
+
+static void Bridge_ClearNameQueued( void )
+{
+	int i;
+
+	for ( i = 0; i < s_nameCount; ++i ) {
+		s_names[i].queued = 0;
+	}
+}
+
+static qboolean Bridge_EventsArmed( void )
+{
+	return s_inited && bridge_enable.integer ? qtrue : qfalse;
+}
+
+static unsigned short Bridge_EventEntity( int entityNum )
+{
+	if ( entityNum < 0 || entityNum > 0xfffe ) {
+		return (unsigned short)BRIDGE_EVENT_NONE;
+	}
+	return (unsigned short)entityNum;
+}
+
+static qboolean Bridge_PushEvent( const BridgeEventRec *rec )
+{
+	if ( !Bridge_EventsArmed() ) {
+		return qfalse;
+	}
+	if ( s_eventCount >= BRIDGE_EVENT_QUEUE ) {
+		if ( s_eventDropped != 0xffffffffu ) {
+			s_eventDropped++;
+		}
+		return qfalse;
+	}
+	s_events[s_eventCount++] = *rec;
+	return qtrue;
+}
+
+static int Bridge_AddName( unsigned char table, int index, const char *path, short *slots, int slotCount )
+{
+	int slot;
+
+	Bridge_InitEventSlots();
+	if ( !path || !path[0] || index < 0 || index >= slotCount ) {
+		return -1;
+	}
+	slot = slots[index];
+	if ( slot >= 0 && slot < s_nameCount ) {
+		if ( !s_names[slot].path[0] ) {
+			Q_strncpyz( s_names[slot].path, path, sizeof( s_names[slot].path ) );
+		}
+		return slot;
+	}
+	if ( s_nameCount >= BRIDGE_NAME_CAP ) {
+		return -1;
+	}
+	slot = s_nameCount++;
+	memset( &s_names[slot], 0, sizeof( s_names[slot] ) );
+	s_names[slot].index = index;
+	s_names[slot].table = table;
+	Q_strncpyz( s_names[slot].path, path, sizeof( s_names[slot].path ) );
+	slots[index] = (short)slot;
+	return slot;
+}
+
+static qboolean Bridge_PushName( int slot )
+{
+	BridgeEventRec rec;
+
+	if ( slot < 0 || slot >= s_nameCount || !s_names[slot].path[0] ) {
+		return qfalse;
+	}
+	if ( s_names[slot].queued ) {
+		return qtrue;
+	}
+	memset( &rec, 0, sizeof( rec ) );
+	rec.kind = BRIDGE_EVENT_NAME;
+	rec.flags = s_names[slot].table;
+	rec.entityNum = (unsigned short)BRIDGE_EVENT_NONE;
+	rec.index = s_names[slot].index;
+	Q_strncpyz( rec.path, s_names[slot].path, sizeof( rec.path ) );
+	if ( !Bridge_PushEvent( &rec ) ) {
+		return qfalse;
+	}
+	s_names[slot].queued = 1;
+	s_names[slot].announced = 1;
+	return qtrue;
+}
+
+static void Bridge_PushNameFor( short *slots, int slotCount, int index )
+{
+	int slot;
+
+	Bridge_InitEventSlots();
+	if ( index < 0 || index >= slotCount ) {
+		return;
+	}
+	slot = slots[index];
+	if ( slot < 0 || s_names[slot].announced ) {
+		return;
+	}
+	Bridge_PushName( slot );
+}
+
+void Bridge_RememberEffect( int id, const char *path )
+{
+	Bridge_AddName( BRIDGE_EVENT_NAME_EFFECT, id, path, s_effectSlot, BRIDGE_EFFECT_SLOTS );
+}
+
+void Bridge_RememberSound( int handle, const char *path )
+{
+	if ( handle <= 0 ) {
+		return;
+	}
+	Bridge_AddName( BRIDGE_EVENT_NAME_SOUND, handle, path, s_soundSlot, BRIDGE_SOUND_SLOTS );
+}
+
+void Bridge_NoteEffect( int id, const vec3_t origin, const vec3_t dir, int entityNum, int bolt )
+{
+	BridgeEventRec rec;
+
+	if ( !Bridge_EventsArmed() ) {
+		return;
+	}
+	memset( &rec, 0, sizeof( rec ) );
+	rec.kind = BRIDGE_EVENT_EFFECT;
+	rec.entityNum = Bridge_EventEntity( entityNum );
+	rec.index = id;
+	if ( origin ) {
+		VectorCopy( origin, rec.origin );
+	}
+	if ( dir ) {
+		VectorCopy( dir, rec.vec );
+	}
+	rec.extra = bolt;
+	rec.time = cg.time;
+	Bridge_PushEvent( &rec );
+	Bridge_PushNameFor( s_effectSlot, BRIDGE_EFFECT_SLOTS, id );
+}
+
+void Bridge_NoteSound( int handle, const vec3_t origin, int entityNum, int channel, qboolean local )
+{
+	BridgeEventRec rec;
+
+	if ( !Bridge_EventsArmed() ) {
+		return;
+	}
+	memset( &rec, 0, sizeof( rec ) );
+	rec.kind = BRIDGE_EVENT_SOUND;
+	if ( local ) {
+		rec.flags = (unsigned char)( rec.flags | BRIDGE_EVENT_SOUND_LOCAL );
+	} else if ( !origin ) {
+		rec.flags = (unsigned char)( rec.flags | BRIDGE_EVENT_SOUND_ENTITY );
+	}
+	rec.entityNum = Bridge_EventEntity( entityNum );
+	rec.index = handle;
+	if ( origin ) {
+		VectorCopy( origin, rec.origin );
+	}
+	rec.extra = channel;
+	rec.time = cg.time;
+	Bridge_PushEvent( &rec );
+	Bridge_PushNameFor( s_soundSlot, BRIDGE_SOUND_SLOTS, handle );
+}
+
+void Bridge_NoteBeam( int weapon, const vec3_t start, const vec3_t end, qboolean alt )
+{
+	BridgeEventRec rec;
+
+	if ( !Bridge_EventsArmed() ) {
+		return;
+	}
+	memset( &rec, 0, sizeof( rec ) );
+	rec.kind = BRIDGE_EVENT_MISSILE;
+	rec.flags = BRIDGE_EVENT_MISSILE_BEAM;
+	rec.entityNum = (unsigned short)BRIDGE_EVENT_NONE;
+	rec.index = weapon;
+	if ( start ) {
+		VectorCopy( start, rec.origin );
+	}
+	if ( end ) {
+		VectorCopy( end, rec.vec );
+	}
+	rec.extra = alt ? 1 : 0;
+	rec.time = cg.time;
+	Bridge_PushEvent( &rec );
+}
+
+static void Bridge_SampleMissiles( void )
+{
+	unsigned char here[MAX_GENTITIES];
+	int i;
+
+	if ( !cg.snap ) {
+		return;
+	}
+	memset( here, 0, sizeof( here ) );
+	for ( i = 0; i < cg.snap->numEntities; ++i ) {
+		int num = cg.snap->entities[i].number;
+		centity_t *cent;
+		gentity_t *gent;
+		BridgeEventRec rec;
+		qboolean alt;
+
+		if ( num < 0 || num >= MAX_GENTITIES ) {
+			continue;
+		}
+		cent = &cg_entities[num];
+		if ( cent->currentState.eType != ET_MISSILE ) {
+			continue;
+		}
+		gent = &g_entities[num];
+		alt = ( cent->currentState.eFlags & EF_ALT_FIRING ) ? qtrue : qfalse;
+		if ( gent->inuse && gent->alt_fire ) {
+			alt = qtrue;
+		}
+		memset( &rec, 0, sizeof( rec ) );
+		rec.kind = BRIDGE_EVENT_MISSILE;
+		if ( !s_missileWasHere[num] ) {
+			rec.flags = (unsigned char)( rec.flags | BRIDGE_EVENT_MISSILE_NEW );
+		}
+		rec.entityNum = (unsigned short)num;
+		rec.index = cent->currentState.weapon;
+		VectorCopy( cent->lerpOrigin, rec.origin );
+		VectorCopy( cent->currentState.pos.trDelta, rec.vec );
+		rec.extra = alt ? 1 : 0;
+		rec.time = cg.time;
+		if ( Bridge_PushEvent( &rec ) ) {
+			here[num] = 1;
+		}
+	}
+	memcpy( s_missileWasHere, here, sizeof( s_missileWasHere ) );
+}
+
+static void Bridge_QueueNameRound( void )
+{
+	int added = 0;
+	int scanned = 0;
+
+	if ( s_nameCount <= 0 ) {
+		return;
+	}
+	while ( added < BRIDGE_EVENT_NAMES_PER_FRAME && scanned < s_nameCount ) {
+		int slot = s_nameCursor;
+
+		s_nameCursor++;
+		if ( s_nameCursor >= s_nameCount ) {
+			s_nameCursor = 0;
+		}
+		scanned++;
+		if ( s_names[slot].queued ) {
+			continue;
+		}
+		if ( !Bridge_PushName( slot ) ) {
+			s_nameCursor = slot;
+			break;
+		}
+		added++;
+	}
+}
+
+static void Bridge_StoreEvent( uint8_t *p, const BridgeEventRec *rec )
+{
+	memset( p, 0, BRIDGE_EVENT_RECORD_SIZE );
+	p[0] = rec->kind;
+	if ( rec->kind == BRIDGE_EVENT_NAME ) {
+		p[1] = rec->flags;
+		p[2] = 0xff;
+		p[3] = 0xff;
+		Bridge_WriteI32( p + 4, rec->index );
+		memcpy( p + 8, rec->path, 64 );
+		p[71] = 0;
+		return;
+	}
+	p[1] = rec->flags;
+	Bridge_WriteU16( p + 2, rec->entityNum );
+	Bridge_WriteI32( p + 4, rec->index );
+	Bridge_WriteF32( p + 8, rec->origin[0] );
+	Bridge_WriteF32( p + 12, rec->origin[1] );
+	Bridge_WriteF32( p + 16, rec->origin[2] );
+	Bridge_WriteF32( p + 20, rec->vec[0] );
+	Bridge_WriteF32( p + 24, rec->vec[1] );
+	Bridge_WriteF32( p + 28, rec->vec[2] );
+	Bridge_WriteI32( p + 32, rec->extra );
+	Bridge_WriteI32( p + 36, rec->time );
+}
+
+static void Bridge_SendEvents( uint32_t frame, int serverTime )
+{
+	int offset = 0;
+	qboolean first = qtrue;
+
+	static_assert( BRIDGE_EVENT_RECORD_SIZE == 80, "event record size" );
+	static_assert( BRIDGE_EVENT_PACKET_MAX == 1228, "event packet max" );
+	static_assert( BRIDGE_EVENT_QUEUE == 256, "event queue" );
+	static_assert( BRIDGE_HEADER_SIZE + 8 + BRIDGE_EVENT_RECORD_SIZE * BRIDGE_EVENT_MAX_PER_PACKET == BRIDGE_EVENT_PACKET_MAX, "event packet math" );
+
+	Bridge_SampleMissiles();
+	Bridge_QueueNameRound();
+	if ( s_eventCount == 0 && s_eventDropped == 0 ) {
+		Bridge_ClearNameQueued();
+		return;
+	}
+
+	while ( offset < s_eventCount || first ) {
+		uint8_t packet[BRIDGE_EVENT_PACKET_MAX];
+		uint8_t *p;
+		int count = s_eventCount - offset;
+		uint32_t dropped = first ? s_eventDropped : 0;
+		int n;
+
+		if ( count > BRIDGE_EVENT_MAX_PER_PACKET ) {
+			count = BRIDGE_EVENT_MAX_PER_PACKET;
+		}
+		if ( count < 0 ) {
+			count = 0;
+		}
+		memset( packet, 0, sizeof( packet ) );
+		p = Bridge_WriteHeader( packet, BRIDGE_PACKET_EVENT, s_sequence++, frame, serverTime );
+		p = Bridge_WriteU16( p, (unsigned int)count );
+		p = Bridge_WriteU16( p, 0 );
+		p = Bridge_WriteU32( p, dropped );
+		for ( n = 0; n < count; ++n ) {
+			Bridge_StoreEvent( p, &s_events[offset + n] );
+			p += BRIDGE_EVENT_RECORD_SIZE;
+		}
+		if ( (int)( p - packet ) != BRIDGE_HEADER_SIZE + 8 + count * BRIDGE_EVENT_RECORD_SIZE ) {
+			Bridge_Complain( "event packet size mismatch" );
+			break;
+		}
+		Bridge_Send( packet, (int)( p - packet ) );
+		first = qfalse;
+		offset += count;
+		if ( count == 0 ) {
+			break;
+		}
+	}
+
+	s_eventCount = 0;
+	s_eventDropped = 0;
+	Bridge_ClearNameQueued();
+}
+
+static void Bridge_Stop( qboolean clearNames )
 {
 	BridgeNet_Close();
 	s_streaming = qfalse;
@@ -1228,6 +1648,15 @@ void Bridge_Shutdown( void )
 	memset( s_npcLastFireTime, 0, sizeof( s_npcLastFireTime ) );
 	memset( s_moverWasHere, 0, sizeof( s_moverWasHere ) );
 	memset( s_moverLastFlags, 0, sizeof( s_moverLastFlags ) );
+	Bridge_ClearEventQueue();
+	if ( clearNames ) {
+		Bridge_ClearNames();
+	}
+}
+
+void Bridge_Shutdown( void )
+{
+	Bridge_Stop( qtrue );
 }
 
 void Bridge_NoteEntityEvent( int entityNum, int event )
@@ -1265,7 +1694,7 @@ void Bridge_Frame( int stereoView )
 	cgi_Cvar_Update( &bridge_enable );
 	if ( !bridge_enable.integer ) {
 		if ( s_streaming ) {
-			Bridge_Shutdown();
+			Bridge_Stop( qfalse );
 			CG_Printf( "Bridge: UDP pose stream stopped\n" );
 		}
 		return;
@@ -1331,4 +1760,5 @@ void Bridge_Frame( int stereoView )
 	Bridge_SendNpcs( (uint32_t)cg.clientFrame, cg.time );
 	Bridge_SendHud( (uint32_t)cg.clientFrame, cg.time );
 	Bridge_SendMovers( (uint32_t)cg.clientFrame, cg.time );
+	Bridge_SendEvents( (uint32_t)cg.clientFrame, cg.time );
 }

@@ -26,6 +26,7 @@ PACKET_RENDER = 4
 PACKET_NPC = 5
 PACKET_HUD = 6
 PACKET_MOVER = 7
+PACKET_EVENT = 8
 POSE_SIZE = 160
 MAP_SIZE = 84
 SABER_SIZE = 672
@@ -41,6 +42,19 @@ MOVER_PACKET_MAX = 28 + MOVER_ENTRY_SIZE * MOVER_MAX_PER_PACKET
 MOVER_NEW = 0x01
 MOVER_MOVING = 0x02
 MOVER_NODRAW = 0x04
+EVENT_RECORD_SIZE = 80
+EVENT_MAX_PER_PACKET = 15
+EVENT_PACKET_MAX = 28 + EVENT_RECORD_SIZE * EVENT_MAX_PER_PACKET
+EVENT_MISSILE = 1
+EVENT_EFFECT = 2
+EVENT_SOUND = 3
+EVENT_NAME = 4
+EVENT_MISSILE_NEW = 0x01
+EVENT_MISSILE_BEAM = 0x02
+EVENT_SOUND_LOCAL = 0x01
+EVENT_SOUND_ENTITY = 0x02
+EVENT_NAME_EFFECT = 1
+EVENT_NAME_SOUND = 2
 MAP_NAME_LEN = 64
 HILT_NAME_LEN = 64
 SABER_BLADE_SLOTS = 16
@@ -268,6 +282,39 @@ def decode_packet(buf: bytes) -> dict:
             })
         header["movers"] = movers
         return header
+    if kind == PACKET_EVENT:
+        if len(buf) < 28:
+            raise PacketError("short event packet (%d)" % len(buf))
+        count = _u16(buf, 20)
+        if count > EVENT_MAX_PER_PACKET or len(buf) < 28 + count * EVENT_RECORD_SIZE:
+            raise PacketError("bad event packet count %d (%d bytes)" % (count, len(buf)))
+        header["event_count"] = count
+        header["event_dropped"] = _u32(buf, 24)
+        events = []
+        for index in range(count):
+            off = 28 + index * EVENT_RECORD_SIZE
+            kind_id = buf[off]
+            if kind_id == EVENT_NAME:
+                path = buf[off + 8:off + 72].split(b"\x00", 1)[0].decode("latin-1", "replace")
+                events.append({
+                    "kind": kind_id,
+                    "table": buf[off + 1],
+                    "index": _i32(buf, off + 4),
+                    "path": path,
+                })
+            else:
+                events.append({
+                    "kind": kind_id,
+                    "flags": buf[off + 1],
+                    "entity": _u16(buf, off + 2),
+                    "index": _i32(buf, off + 4),
+                    "origin": _vec3(buf, off + 8),
+                    "vec": _vec3(buf, off + 20),
+                    "extra": _i32(buf, off + 32),
+                    "time": _i32(buf, off + 36),
+                })
+        header["events"] = events
+        return header
     header["skipped"] = True
     return header
 
@@ -446,6 +493,37 @@ def format_packet(packet: dict, verbose: bool) -> str:
                     _fmt_vec(mover["velocity"]),
                 )
             )
+        return "\n".join(lines)
+    if packet["type"] == PACKET_EVENT:
+        lines = [
+            "event seq=%d frame=%d t=%d count=%d dropped=%d"
+            % (
+                packet["sequence"],
+                packet["frame"],
+                packet["server_time"],
+                packet["event_count"],
+                packet["event_dropped"],
+            )
+        ]
+        kind_names = {EVENT_MISSILE: "missile", EVENT_EFFECT: "effect", EVENT_SOUND: "sound", EVENT_NAME: "name"}
+        for event in packet["events"]:
+            label = kind_names.get(event["kind"], str(event["kind"]))
+            if event["kind"] == EVENT_NAME:
+                table = "effect" if event["table"] == EVENT_NAME_EFFECT else "sound" if event["table"] == EVENT_NAME_SOUND else str(event["table"])
+                lines.append("  name %s id=%d %s" % (table, event["index"], event["path"] or '""'))
+            else:
+                lines.append(
+                    "  %s ent=%d idx=%d flags=0x%x extra=%d org=%s vec=%s"
+                    % (
+                        label,
+                        event["entity"],
+                        event["index"],
+                        event["flags"],
+                        event["extra"],
+                        _fmt_vec(event["origin"]),
+                        _fmt_vec(event["vec"]),
+                    )
+                )
         return "\n".join(lines)
     if packet["type"] == PACKET_HUD:
         return (
@@ -723,6 +801,32 @@ def self_test() -> int:
     assert mover["movers"][0]["origin"] == (64.0, 0.0, 8.0)
     assert mover["movers"][0]["angles"] == (0.0, 90.0, 0.0)
     assert mover["movers"][0]["velocity"] == (100.0, 0.0, 0.0)
+
+    event_buf = bytearray(28 + EVENT_RECORD_SIZE * 2)
+    struct.pack_into("<4sHHIIi", event_buf, 0, MAGIC, VERSION, PACKET_EVENT, 15, 42, 2000)
+    struct.pack_into("<HHI", event_buf, 20, 2, 0, 3)
+    struct.pack_into("<BBHi", event_buf, 28, EVENT_MISSILE, EVENT_MISSILE_NEW | EVENT_MISSILE_BEAM, 0xFFFF, 4)
+    struct.pack_into("<3f3fii", event_buf, 36, 1.0, 2.0, 3.0, 9.0, 8.0, 7.0, 1, 2000)
+    name_off = 28 + EVENT_RECORD_SIZE
+    event_buf[name_off] = EVENT_NAME
+    event_buf[name_off + 1] = EVENT_NAME_EFFECT
+    event_buf[name_off + 2] = 0xFF
+    event_buf[name_off + 3] = 0xFF
+    struct.pack_into("<i", event_buf, name_off + 4, 12)
+    event_buf[name_off + 8:name_off + 8 + len(b"effects/force/heal.efx")] = b"effects/force/heal.efx"
+    assert EVENT_PACKET_MAX == 1228
+    event = decode_packet(bytes(event_buf))
+    assert event["event_count"] == 2 and event["event_dropped"] == 3
+    assert event["events"][0]["kind"] == EVENT_MISSILE
+    assert event["events"][0]["flags"] == (EVENT_MISSILE_NEW | EVENT_MISSILE_BEAM)
+    assert event["events"][0]["entity"] == 0xFFFF
+    assert event["events"][0]["index"] == 4
+    assert event["events"][0]["origin"] == (1.0, 2.0, 3.0)
+    assert event["events"][0]["vec"] == (9.0, 8.0, 7.0)
+    assert event["events"][0]["extra"] == 1 and event["events"][0]["time"] == 2000
+    assert event["events"][1]["path"] == "effects/force/heal.efx"
+    assert event["events"][1]["table"] == EVENT_NAME_EFFECT
+    assert event["events"][1]["index"] == 12
     # Type 1 and type 2 still decode after a type 3 packet, and unknown types are skipped.
     assert decode_packet(_pack_pose())["type"] == PACKET_POSE
     unknown = bytearray(24)
@@ -760,8 +864,8 @@ def self_test() -> int:
         sock.close()
 
     print(
-        "bridge_receiver self-test ok (pose %d, map %d, saber %d, render %d, mover entry %d bytes)"
-        % (POSE_SIZE, MAP_SIZE, SABER_SIZE, RENDER_SIZE, MOVER_ENTRY_SIZE)
+        "bridge_receiver self-test ok (pose %d, map %d, saber %d, render %d, mover entry %d, event record %d bytes)"
+        % (POSE_SIZE, MAP_SIZE, SABER_SIZE, RENDER_SIZE, MOVER_ENTRY_SIZE, EVENT_RECORD_SIZE)
     )
     return 0
 
@@ -793,6 +897,7 @@ def listen(host: str, port: int, verbose: bool, summary: bool) -> int:
     renders = 0
     skipped = 0
     movers = 0
+    events = 0
     last_pose = None
 
     try:
@@ -825,6 +930,8 @@ def listen(host: str, port: int, verbose: bool, summary: bool) -> int:
                     renders += 1
                 elif packet["type"] == PACKET_MOVER:
                     movers += 1
+                elif packet["type"] == PACKET_EVENT:
+                    events += 1
                 if not summary:
                     suffix = "" if missed == 0 else "  gap=%d" % missed
                     print(format_packet(packet, verbose) + suffix, flush=True)
@@ -836,8 +943,8 @@ def listen(host: str, port: int, verbose: bool, summary: bool) -> int:
             if elapsed >= 1.0:
                 rate = window_count / elapsed
                 print(
-                    "rate %.1f pkt/s  window=%d total=%d pose=%d map=%d saber=%d render=%d mover=%d skip=%d bad=%d seq_gaps=%d"
-                    % (rate, window_count, total, poses, maps, sabers, renders, movers, skipped, bad, tracker.gaps),
+                    "rate %.1f pkt/s  window=%d total=%d pose=%d map=%d saber=%d render=%d mover=%d event=%d skip=%d bad=%d seq_gaps=%d"
+                    % (rate, window_count, total, poses, maps, sabers, renders, movers, events, skipped, bad, tracker.gaps),
                     flush=True,
                 )
                 if summary and last_pose is not None:
@@ -846,8 +953,8 @@ def listen(host: str, port: int, verbose: bool, summary: bool) -> int:
                 window_count = 0
     except KeyboardInterrupt:
         print(
-            "\nstopped. total=%d pose=%d map=%d saber=%d render=%d mover=%d skip=%d bad=%d seq_gaps=%d"
-            % (total, poses, maps, sabers, renders, movers, skipped, bad, tracker.gaps)
+            "\nstopped. total=%d pose=%d map=%d saber=%d render=%d mover=%d event=%d skip=%d bad=%d seq_gaps=%d"
+            % (total, poses, maps, sabers, renders, movers, events, skipped, bad, tracker.gaps)
         )
         return 0
     finally:
