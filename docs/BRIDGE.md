@@ -310,9 +310,11 @@ Hand flags:
 
 With `bridge_rate 0`, type 4 goes out on every rendered frame, the same rate as type 1 (default `com_maxfps` 125). The smoothed origin changes on those frames. Type 1's origin field is unchanged and still steps with the server tick.
 
-### NPC packet (type 5)
+### NPC packet (type 5, header version 2)
 
-Sent on the same samples as type 4, under the same `bridge_rate` cap, to the same address. One frame can be several datagrams. They share one `sequence` and one `frame`. Each holds at most 10 NPCs. An empty frame is one datagram with `count` 0.
+The game always sends version 2 now. The 20-byte header and the 8-byte body header are unchanged. Version 1 entries were 100 bytes, at most 10 per datagram (1028 bytes). Version 2 entries are 248 bytes, at most 5 per datagram (28 + 1240 = 1268). Bytes 0–99 of each entry are the version 1 layout.
+
+Sent on the same samples as type 4, under the same `bridge_rate` cap, to the same address. One frame can be several datagrams. They share one `sequence` and one `frame`. An empty frame is one datagram with `count` 0.
 
 An NPC is an entity in `cg.snap` whose `gent` has `NPC` or `client`, and is not the player. Dead bodies stay in the list while that entity still exists. `bridge_npc_radius` (default 4096, `0` = no limit) measures distance from `cg.refdef.vieworg` to `cent->lerpOrigin`.
 
@@ -322,13 +324,13 @@ World space matches the other packets: **+X forward, +Y left, +Z up**, game unit
 
 | Offset | Size | Type | Field |
 | ---: | ---: | --- | --- |
-| 0 | 20 | header | type = 5 |
+| 0 | 20 | header | type = 5, version = 2 |
 | 20 | 2 | uint16 | `count` (entries in this datagram) |
 | 22 | 2 | uint16 | `total` (NPCs this frame, all datagrams) |
 | 24 | 1 | uint8 | `packetIndex` (0-based) |
 | 25 | 1 | uint8 | `packetCount` |
 | 26 | 2 | uint16 | reserved, 0 |
-| 28 | 100 × count | entries | at most 10; datagram is at most 1028 bytes |
+| 28 | 248 × count | entries | at most 5; datagram is at most 1268 bytes |
 
 Each entry:
 
@@ -348,5 +350,18 @@ Each entry:
 | 52 | 4 | int32 | health |
 | 56 | 12 | float[3] | `pos.trDelta` |
 | 68 | 32 | char[32] | `NPC_type` |
+| 100 | 1 | uint8 | hand flags: `0x01` `*r_hand` valid, `0x02` `*l_hand` valid |
+| 101 | 1 | uint8 | fire count since last type 5 send (`EV_FIRE_WEAPON` + `EV_ALT_FIRE`, saturates at 255, then reset) |
+| 102 | 1 | uint8 | fire flags: `0x01` primary, `0x02` alt, `0x04` `EF_FIRING`, `0x08` `EF_ALT_FIRING` |
+| 103 | 1 | uint8 | saber flags: `0x01` blade 1 on, `0x02` blade 2 on, `0x04` dual, `0x08` staff |
+| 104 | 48 | float[12] | `*r_hand` world matrix: origin, +X, +Y, +Z (Ghoul2 columns) |
+| 152 | 48 | float[12] | `*l_hand`, same layout (`handLBolt`) |
+| 200 | 8 | float[2] | blade lengths: `saber[0].blade[0]`, then `saber[0].blade[1]` or `saber[1].blade[0]` when dual |
+| 208 | 2 | uint8[2] | blade colors (`saber_colors_t`), same blade order |
+| 210 | 2 | uint16 | reserved, 0 |
+| 212 | 32 | char[32] | hilt name (`saber[0].name`, empty if none) |
+| 244 | 4 | int32 | `cg.time` of the latest fire event, 0 if none |
+
+Hand matrices use the same `G2API_GetBoltMatrix` call as type 4: the NPC ghoul2 model, `handRBolt` / `handLBolt`, `lerpOrigin` (plus the model-scale Z nudge), and yaw from `renderAngles`. Axis order is the same columns: +X, +Y, +Z, in **+X forward, +Y left, +Z up** world units.
 
 Windows install, launch, and checks are in the sections above. To point the stream at another machine, set `bridge_host` to that machine's numeric IPv4 address and run the receiver with `--host 0.0.0.0`.

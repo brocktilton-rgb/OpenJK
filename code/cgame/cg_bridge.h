@@ -54,12 +54,24 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #define BRIDGE_RENDER_HAND_R		0x01u
 #define BRIDGE_RENDER_HAND_L		0x02u
 
-// Type 5. Header is the shared 20 bytes. At most 10 entries per datagram.
+// Type 5 version 2. Shared 20-byte header plus 8-byte body header.
+// Bytes 0-99 of each entry match v1. Max 5 entries: 28 + 5*248 = 1268.
 #define BRIDGE_HEADER_SIZE			20
-#define BRIDGE_NPC_ENTRY_SIZE		100
-#define BRIDGE_NPC_MAX_PER_PACKET	10
-#define BRIDGE_NPC_PACKET_MAX		1028
+#define BRIDGE_NPC_VERSION			2
+#define BRIDGE_NPC_ENTRY_SIZE		248
+#define BRIDGE_NPC_MAX_PER_PACKET	5
+#define BRIDGE_NPC_PACKET_MAX		1268
 #define BRIDGE_NPC_NAME_LEN			32
+#define BRIDGE_NPC_HAND_R			0x01u
+#define BRIDGE_NPC_HAND_L			0x02u
+#define BRIDGE_NPC_FIRE_PRIMARY		0x01u
+#define BRIDGE_NPC_FIRE_ALT			0x02u
+#define BRIDGE_NPC_FIRE_EF			0x04u
+#define BRIDGE_NPC_FIRE_ALT_EF		0x08u
+#define BRIDGE_NPC_SABER_BLADE1		0x01u
+#define BRIDGE_NPC_SABER_BLADE2		0x02u
+#define BRIDGE_NPC_SABER_DUAL		0x04u
+#define BRIDGE_NPC_SABER_STAFF		0x08u
 #define BRIDGE_NPC_NEW				0x01u
 #define BRIDGE_NPC_WEAPON			0x02u
 #define BRIDGE_NPC_SABER			0x04u
@@ -79,5 +91,6 @@ void Bridge_Init( void );
 void Bridge_Shutdown( void );
 void Bridge_Frame( int stereoView );
 qboolean Bridge_ConsoleCommand( void );
+void Bridge_NoteEntityEvent( int entityNum, int event );
 
 #endif

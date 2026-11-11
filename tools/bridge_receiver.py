@@ -29,7 +29,9 @@ MAP_SIZE = 84
 SABER_SIZE = 672
 RENDER_SIZE = 228
 NPC_ENTRY_SIZE = 100
+NPC_ENTRY_SIZE_V2 = 248
 NPC_MAX_PER_PACKET = 10
+NPC_MAX_PER_PACKET_V2 = 5
 MAP_NAME_LEN = 64
 HILT_NAME_LEN = 64
 SABER_BLADE_SLOTS = 16
@@ -82,7 +84,7 @@ def _header(buf: bytes) -> dict:
     if magic != MAGIC:
         raise PacketError("bad magic %r" % (magic,))
     version = _u16(buf, 4)
-    if version != VERSION:
+    if version not in (1, 2):
         raise PacketError("unsupported version %d" % version)
     return {
         "version": version,
@@ -180,8 +182,10 @@ def decode_packet(buf: bytes) -> dict:
     if kind == PACKET_NPC:
         if len(buf) < 28:
             raise PacketError("short npc packet (%d)" % len(buf))
+        entry_size = NPC_ENTRY_SIZE_V2 if header["version"] >= 2 else NPC_ENTRY_SIZE
+        max_count = NPC_MAX_PER_PACKET_V2 if header["version"] >= 2 else NPC_MAX_PER_PACKET
         count = _u16(buf, 20)
-        if count > NPC_MAX_PER_PACKET or len(buf) < 28 + count * NPC_ENTRY_SIZE:
+        if count > max_count or len(buf) < 28 + count * entry_size:
             raise PacketError("bad npc packet count %d (%d bytes)" % (count, len(buf)))
         header["npc_count"] = count
         header["npc_total"] = _u16(buf, 22)
@@ -189,9 +193,9 @@ def decode_packet(buf: bytes) -> dict:
         header["npc_packets"] = buf[25]
         npcs = []
         for index in range(count):
-            off = 28 + index * NPC_ENTRY_SIZE
+            off = 28 + index * entry_size
             name = buf[off + 68:off + 100].split(b"\x00", 1)[0].decode("ascii", "replace")
-            npcs.append({
+            npc = {
                 "entity": _u16(buf, off),
                 "state": buf[off + 2],
                 "flags": buf[off + 3],
@@ -206,7 +210,19 @@ def decode_packet(buf: bytes) -> dict:
                 "health": _i32(buf, off + 52),
                 "velocity": _vec3(buf, off + 56),
                 "npc_type": name,
-            })
+            }
+            if header["version"] >= 2:
+                npc["hand_flags"] = buf[off + 100]
+                npc["fire_count"] = buf[off + 101]
+                npc["fire_flags"] = buf[off + 102]
+                npc["saber_flags"] = buf[off + 103]
+                npc["hand_r"] = _read_hand(buf, off + 104)
+                npc["hand_l"] = _read_hand(buf, off + 152)
+                npc["blade_len"] = struct.unpack_from("<2f", buf, off + 200)
+                npc["blade_color"] = (buf[off + 208], buf[off + 209])
+                npc["hilt"] = buf[off + 212:off + 244].split(b"\x00", 1)[0].decode("ascii", "replace")
+                npc["last_fire_time"] = _i32(buf, off + 244)
+            npcs.append(npc)
         header["npcs"] = npcs
         return header
     header["skipped"] = True
@@ -570,6 +586,29 @@ def self_test() -> int:
     assert npc["npcs"][0]["entity"] == 17 and npc["npcs"][0]["npc_type"] == "rodian"
     assert npc["npcs"][0]["origin"] == (8.0, 9.0, 10.0)
     assert npc["npcs"][0]["health"] == 40
+    assert "hand_flags" not in npc["npcs"][0]
+
+    npc2 = bytearray(28 + NPC_ENTRY_SIZE_V2)
+    npc2[:len(npc_buf)] = npc_buf
+    struct.pack_into("<H", npc2, 4, 2)
+    npc2[28 + 100] = 0x01
+    npc2[28 + 101] = 2
+    npc2[28 + 102] = 0x05
+    npc2[28 + 103] = 0x09
+    struct.pack_into("<3f", npc2, 28 + 104, 1, 2, 3)
+    struct.pack_into("<2f", npc2, 28 + 200, 32.0, 0.0)
+    npc2[28 + 208] = 4
+    npc2[28 + 212:28 + 216] = b"Kyle"
+    struct.pack_into("<i", npc2, 28 + 244, 1700)
+    parsed = decode_packet(bytes(npc2))
+    assert parsed["version"] == 2
+    assert parsed["npcs"][0]["hand_flags"] == 0x01
+    assert parsed["npcs"][0]["fire_count"] == 2
+    assert parsed["npcs"][0]["hand_r"]["origin"] == (1.0, 2.0, 3.0)
+    assert parsed["npcs"][0]["blade_len"] == (32.0, 0.0)
+    assert parsed["npcs"][0]["blade_color"] == (4, 0)
+    assert parsed["npcs"][0]["hilt"] == "Kyle"
+    assert parsed["npcs"][0]["last_fire_time"] == 1700
     # Type 1 and type 2 still decode after a type 3 packet, and unknown types are skipped.
     assert decode_packet(_pack_pose())["type"] == PACKET_POSE
     unknown = bytearray(24)

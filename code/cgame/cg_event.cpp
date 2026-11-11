@@ -25,6 +25,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 
 #include "cg_headers.h"
 
+#include "cg_bridge.h"
 #include "cg_media.h"
 #include "FxScheduler.h"
 
@@ -289,6 +290,7 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 
 	//ci = &cent->gent->client->clientInfo;
 	clientNum = cent->gent->s.number;
+	Bridge_NoteEntityEvent( es->number, event );
 
 	switch ( event ) {
 	//

@@ -49,6 +49,9 @@ static uint32_t		s_sentNpc = 0;
 static vmCvar_t		bridge_npc_radius;
 static unsigned char	s_npcWasHere[MAX_GENTITIES];
 static int			s_npcLastFlags[MAX_GENTITIES];
+static unsigned char	s_npcFireCount[MAX_GENTITIES];
+static unsigned char	s_npcFireBits[MAX_GENTITIES];
+static int			s_npcLastFireTime[MAX_GENTITIES];
 static uint32_t		s_sendDrops = 0;
 static uint32_t		s_sendFails = 0;
 static int			s_lastPoseMs = 0;
@@ -105,19 +108,24 @@ static uint8_t *Bridge_WriteVec3( uint8_t *p, const vec3_t v )
 	return p;
 }
 
-static uint8_t *Bridge_WriteHeader( uint8_t *p, unsigned int type, uint32_t sequence, uint32_t frame, int serverTime )
+static uint8_t *Bridge_WriteHeaderVersion( uint8_t *p, unsigned int version, unsigned int type, uint32_t sequence, uint32_t frame, int serverTime )
 {
 	p[0] = 'O';
 	p[1] = 'J';
 	p[2] = 'B';
 	p[3] = '1';
 	p += 4;
-	p = Bridge_WriteU16( p, BRIDGE_VERSION );
+	p = Bridge_WriteU16( p, version );
 	p = Bridge_WriteU16( p, type );
 	p = Bridge_WriteU32( p, sequence );
 	p = Bridge_WriteU32( p, frame );
 	p = Bridge_WriteI32( p, serverTime );
 	return p;
+}
+
+static uint8_t *Bridge_WriteHeader( uint8_t *p, unsigned int type, uint32_t sequence, uint32_t frame, int serverTime )
+{
+	return Bridge_WriteHeaderVersion( p, BRIDGE_VERSION, type, sequence, frame, serverTime );
 }
 
 static void Bridge_Complain( const char *msg )
@@ -733,6 +741,103 @@ static uint8_t *Bridge_WriteNpc( uint8_t *p, int entityNum )
 	memcpy( p, name, BRIDGE_NPC_NAME_LEN );
 	p += BRIDGE_NPC_NAME_LEN;
 
+	{
+		vec3_t boltAngles;
+		vec3_t boltOrigin;
+		vec3_t handOrg;
+		vec3_t handX;
+		vec3_t handY;
+		vec3_t handZ;
+		unsigned int handFlags = 0;
+		unsigned int fireFlags = s_npcFireBits[entityNum];
+		unsigned int saberFlags = 0;
+		float bladeLen[2];
+		unsigned char bladeColor[2];
+		char hilt[BRIDGE_NPC_NAME_LEN];
+		int fireCount = s_npcFireCount[entityNum];
+
+		VectorClear( boltAngles );
+		VectorCopy( cent->lerpOrigin, boltOrigin );
+		boltAngles[YAW] = cent->renderAngles[YAW];
+		if ( cent->currentState.modelScale[2] && cent->currentState.modelScale[2] != 1.0f ) {
+			boltOrigin[2] += 24.0f * ( cent->currentState.modelScale[2] - 1.0f );
+		}
+		if ( cent->currentState.eFlags & EF_FIRING ) {
+			fireFlags |= BRIDGE_NPC_FIRE_EF;
+		}
+		if ( cent->currentState.eFlags & EF_ALT_FIRING ) {
+			fireFlags |= BRIDGE_NPC_FIRE_ALT_EF;
+		}
+		bladeLen[0] = 0.0f;
+		bladeLen[1] = 0.0f;
+		bladeColor[0] = 0;
+		bladeColor[1] = 0;
+		memset( hilt, 0, sizeof( hilt ) );
+		if ( gent->client ) {
+			playerState_t *ps = &gent->client->ps;
+			saberInfo_t *saber = &ps->saber[0];
+
+			bladeLen[0] = saber->blade[0].length;
+			bladeColor[0] = (unsigned char)saber->blade[0].color;
+			if ( saber->blade[0].active ) {
+				saberFlags |= BRIDGE_NPC_SABER_BLADE1;
+			}
+			if ( ps->dualSabers ) {
+				saberFlags |= BRIDGE_NPC_SABER_DUAL;
+				bladeLen[1] = ps->saber[1].blade[0].length;
+				bladeColor[1] = (unsigned char)ps->saber[1].blade[0].color;
+				if ( ps->saber[1].blade[0].active ) {
+					saberFlags |= BRIDGE_NPC_SABER_BLADE2;
+				}
+			} else {
+				bladeLen[1] = saber->blade[1].length;
+				bladeColor[1] = (unsigned char)saber->blade[1].color;
+				if ( saber->blade[1].active ) {
+					saberFlags |= BRIDGE_NPC_SABER_BLADE2;
+				}
+			}
+			if ( saber->type == SABER_STAFF ) {
+				saberFlags |= BRIDGE_NPC_SABER_STAFF;
+			}
+			if ( saber->name && saber->name[0] ) {
+				Q_strncpyz( hilt, saber->name, sizeof( hilt ) );
+			}
+		}
+		if ( Bridge_ReadHandBolt( cent, gent->handRBolt, boltAngles, boltOrigin, handOrg, handX, handY, handZ ) ) {
+			handFlags |= BRIDGE_NPC_HAND_R;
+		} else {
+			VectorClear( handOrg );
+			VectorClear( handX );
+			VectorClear( handY );
+			VectorClear( handZ );
+		}
+		p = Bridge_WriteU8( p, handFlags );
+		p = Bridge_WriteU8( p, (unsigned int)fireCount );
+		p = Bridge_WriteU8( p, fireFlags );
+		p = Bridge_WriteU8( p, saberFlags );
+		p = Bridge_WriteHand( p, handOrg, handX, handY, handZ );
+		if ( Bridge_ReadHandBolt( cent, gent->handLBolt, boltAngles, boltOrigin, handOrg, handX, handY, handZ ) ) {
+			handFlags |= BRIDGE_NPC_HAND_L;
+			start[100] = (uint8_t)handFlags;
+		} else {
+			VectorClear( handOrg );
+			VectorClear( handX );
+			VectorClear( handY );
+			VectorClear( handZ );
+		}
+		p = Bridge_WriteHand( p, handOrg, handX, handY, handZ );
+		p = Bridge_WriteF32( p, bladeLen[0] );
+		p = Bridge_WriteF32( p, bladeLen[1] );
+		p = Bridge_WriteU8( p, bladeColor[0] );
+		p = Bridge_WriteU8( p, bladeColor[1] );
+		p = Bridge_WriteU16( p, 0 );
+		memcpy( p, hilt, BRIDGE_NPC_NAME_LEN );
+		p += BRIDGE_NPC_NAME_LEN;
+		p = Bridge_WriteI32( p, s_npcLastFireTime[entityNum] );
+		s_npcFireCount[entityNum] = 0;
+		s_npcFireBits[entityNum] = 0;
+	}
+
 	if ( (int)( p - start ) != BRIDGE_NPC_ENTRY_SIZE ) {
 		return start;
 	}
@@ -753,8 +858,8 @@ static void Bridge_SendNpcs( uint32_t frame, int serverTime )
 	uint32_t seq;
 
 	static_assert( BRIDGE_HEADER_SIZE == 20, "bridge header size" );
-	static_assert( BRIDGE_NPC_ENTRY_SIZE == 100, "npc entry size" );
-	static_assert( BRIDGE_NPC_PACKET_MAX == 1028, "npc packet max" );
+	static_assert( BRIDGE_NPC_ENTRY_SIZE == 248, "npc entry size" );
+	static_assert( BRIDGE_NPC_PACKET_MAX == 1268, "npc packet max" );
 	static_assert( BRIDGE_HEADER_SIZE + 8 + BRIDGE_NPC_ENTRY_SIZE * BRIDGE_NPC_MAX_PER_PACKET == BRIDGE_NPC_PACKET_MAX, "npc packet math" );
 
 	if ( !cg.snap ) {
@@ -809,7 +914,7 @@ static void Bridge_SendNpcs( uint32_t frame, int serverTime )
 			count = 0;
 		}
 		memset( packet, 0, sizeof( packet ) );
-		p = Bridge_WriteHeader( packet, BRIDGE_PACKET_NPC, seq, frame, serverTime );
+		p = Bridge_WriteHeaderVersion( packet, BRIDGE_NPC_VERSION, BRIDGE_PACKET_NPC, seq, frame, serverTime );
 		p = Bridge_WriteU16( p, (unsigned int)count );
 		p = Bridge_WriteU16( p, (unsigned int)total );
 		p = Bridge_WriteU8( p, (unsigned int)packetIndex );
@@ -900,6 +1005,29 @@ void Bridge_Shutdown( void )
 	s_originSnapTime = 0;
 	memset( s_npcWasHere, 0, sizeof( s_npcWasHere ) );
 	memset( s_npcLastFlags, 0, sizeof( s_npcLastFlags ) );
+	memset( s_npcFireCount, 0, sizeof( s_npcFireCount ) );
+	memset( s_npcFireBits, 0, sizeof( s_npcFireBits ) );
+	memset( s_npcLastFireTime, 0, sizeof( s_npcLastFireTime ) );
+}
+
+void Bridge_NoteEntityEvent( int entityNum, int event )
+{
+	if ( entityNum < 0 || entityNum >= MAX_GENTITIES ) {
+		return;
+	}
+	if ( event == EV_FIRE_WEAPON ) {
+		if ( s_npcFireCount[entityNum] < 255 ) {
+			s_npcFireCount[entityNum]++;
+		}
+		s_npcFireBits[entityNum] |= BRIDGE_NPC_FIRE_PRIMARY;
+		s_npcLastFireTime[entityNum] = cg.time;
+	} else if ( event == EV_ALT_FIRE ) {
+		if ( s_npcFireCount[entityNum] < 255 ) {
+			s_npcFireCount[entityNum]++;
+		}
+		s_npcFireBits[entityNum] |= BRIDGE_NPC_FIRE_ALT;
+		s_npcLastFireTime[entityNum] = cg.time;
+	}
 }
 
 void Bridge_Frame( int stereoView )
