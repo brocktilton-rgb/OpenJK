@@ -89,14 +89,14 @@ You should see a `map` line with `maps/t1_rail.bsp`, `pose` lines, and a `rate` 
 
 ## What you should see today
 
-The bridge sends the camera and the player pose, the map name, and (when the lightsaber is the weapon) the saber blades. It does not send the level mesh. In Unreal you get the camera motion and a ground plane. Rooms, doors, and characters from the map are not in the packets yet, so a ground-only view is the right result for this build.
+The bridge sends the camera and the player pose, the map name, the saber blades when a lightsaber is the weapon, and mover motion (type 7). It does not send the level mesh. Rooms come from `tools/bsp2gltf`. Until those meshes are in Unreal, a ground-only view is still the right picture.
 
 A client that only reads type 1 will still see the body step about 20 times a second. That packet is sent every render frame, but the origin inside it only changes on the server tick. Type 4 is the smooth pose. Point the new Unreal reader at type 4.
 
 ## Not done yet
 
-1. Level geometry (the BSP) and a way to export the world. Until that exists, Unreal cannot draw the rooms.
-2. Other entities and NPCs. Only the player pose is sent.
+1. Level meshes are exported by `tools/bsp2gltf`, not by the UDP stream. Unreal still has to load that glTF.
+2. NPCs are type 5 and movers are type 7. Other entity kinds are not sent.
 3. Saber packets are in this build, but the Unreal saber picture was not checked, because that part of the editor is not hooked up yet.
 4. A list of hilt names (`saberInfo_t::name` values such as `Kyle`) is planned as `tools/list_saber_hilts.py`. That script is not in this branch.
 5. On GitHub, the macOS arm64 jobs and the Ubuntu Debug job have failed or been cancelled because the runner never started or the job hit the time limit. That is the build service, not this code. The job that matters for the Windows test is **Windows x86_64 Release (Non-Portable)**.
@@ -129,7 +129,7 @@ All four are archived. The default is off.
 | `bridge_enable` | `0` | `1` streams. `0` closes the socket. |
 | `bridge_host` | `127.0.0.1` | Numeric IPv4 only. Hostnames are rejected so the game cannot block in DNS. |
 | `bridge_port` | `27420` | UDP destination port. |
-| `bridge_rate` | `0` | Maximum samples per second, using client realtime. `0` sends every rendered frame. Clamped to 480. The interval is `1000 / rate` milliseconds. A sample is the map packet (when one is due), the pose packet, the saber packet when a lightsaber is out, the render packet, and the NPC packets. |
+| `bridge_rate` | `0` | Maximum samples per second, using client realtime. `0` sends every rendered frame. Clamped to 480. The interval is `1000 / rate` milliseconds. A sample is the map packet (when one is due), the pose packet, the saber packet when a lightsaber is out, the render packet, the NPC packets, the HUD packet, and the mover packets. |
 | `bridge_npc_radius` | `4096` | NPCs farther than this from the camera are left out of type 5. `0` means no limit. |
 
 Changing host or port reopens the socket on the next frame. A rejected host stops the stream until the value is a numeric IPv4 address again.
@@ -155,7 +155,7 @@ World space is id Tech 3 / Jedi Academy: **+X forward, +Y left, +Z up**, in game
 2. right (`viewaxis[1]`, which is `(0, -1, 0)` at the identity view, because +Y is left)
 3. up (`viewaxis[2]`)
 
-`serverTime` is `cg.time` in milliseconds (pauses and timescale affect it). `frame` is `cg.clientFrame`. `sequence` increments by one for every datagram the game attempts to send (map, pose, saber, and render), and resets to 1 on shutdown. A gap in `sequence` is a dropped datagram. A gap in `frame` while `sequence` stays contiguous is the rate limit (or a skipped stereo eye).
+`serverTime` is `cg.time` in milliseconds (pauses and timescale affect it). `frame` is `cg.clientFrame`. `sequence` increments by one for every datagram the game attempts to send, and resets to 1 on shutdown. The datagrams that split one NPC frame share a single `sequence`, and the datagrams that split one mover frame do the same. A gap in `sequence` is a dropped datagram. A gap in `frame` while `sequence` stays contiguous is the rate limit (or a skipped stereo eye).
 
 Each datagram is one packet. Readers that only know type 1 and type 2 drop any other type. Those two layouts are unchanged, so an older `OJB1` reader keeps working. Type 3 is an additional datagram, not a change to the pose packet.
 
@@ -165,7 +165,7 @@ Each datagram is one packet. Readers that only know type 1 and type 2 drop any o
 | ---: | ---: | --- | --- |
 | 0 | 4 | char[4] | magic `OJB1` |
 | 4 | 2 | uint16 | version = 1 |
-| 6 | 2 | uint16 | type: `1` pose, `2` map, `3` saber, `4` render pose |
+| 6 | 2 | uint16 | type: `1` pose, `2` map, `3` saber, `4` render pose, `5` NPC, `6` HUD, `7` mover |
 | 8 | 4 | uint32 | sequence |
 | 12 | 4 | uint32 | frame (`cg.clientFrame`) |
 | 16 | 4 | int32 | serverTime (`cg.time`, ms) |
@@ -378,6 +378,47 @@ Sent on the same samples as the other bridge packets, under `bridge_rate`. Skipp
 | 44 | int32 | `weapon` |
 | 48 | int32 | ammo, `ammo[weaponData[weapon].ammoIndex]`, or -1 when that index is `AMMO_NONE` or the weapon is out of range |
 | 52 | int32 | `ammoData[ammoIndex].max`, or 0 for `AMMO_NONE` |
+
+### Mover packet (type 7, header version 1)
+
+Sent on the same samples as the other bridge packets, under the same `bridge_rate` cap. Header version stays 1. The 8-byte body header matches type 5. Entries are 44 bytes, at most 24 per datagram (28 + 1056 = 1084). A frame with more movers is several datagrams that share one `sequence` and one `frame`. An empty frame is one datagram with `count` 0.
+
+A mover is an entity in `cg.snap` whose brush is inline: `currentState.solid == SOLID_BMODEL`, and the model string starts with `*`. World model `*0` is not sent. There is no distance cutoff.
+
+`inlineModel` is N from that `*N` string. It is the same number as the `*N` node `tools/bsp2gltf` writes for that inline model. The game looks up `CS_MODELS + currentState.modelindex` first. Brush models usually do not live there: `SV_SetBrushModel` stores N in `modelindex` itself, and the `*N` text stays on the entity (`g_entities[num].model`), which is the string the map compiler wrote. That second string is used when the configstring is not `*N`.
+
+The bsp2gltf vertices are the baked BSP draw verts, already in world space. `lerpOrigin` is the offset from that baked position, not a replacement for it. `lerpAngles` are pitch, yaw, roll. Place the mesh the way `CG_Mover` and `R_RotateForEntity` do: rotate the baked vertex by those angles, then add `lerpOrigin`. With angles at 0, which is a sliding door at rest or in motion, that is a plain translation by `lerpOrigin`. A rotating brush uses the same rotate-then-translate. Do not rebuild the mover in game code; these are the interpolated cgame values (`cent->lerpOrigin`, `cent->lerpAngles`, `currentState.pos.trDelta`).
+
+| Offset | Size | Type | Field |
+| ---: | ---: | --- | --- |
+| 0 | 20 | header | type = 7, version = 1 |
+| 20 | 2 | uint16 | `count` (entries in this datagram) |
+| 22 | 2 | uint16 | `total` (movers this frame, all datagrams) |
+| 24 | 1 | uint8 | `packetIndex` (0-based) |
+| 25 | 1 | uint8 | `packetCount` |
+| 26 | 2 | uint16 | reserved, 0 |
+| 28 | 44 × count | entries | at most 24; datagram is at most 1084 bytes |
+
+Each entry:
+
+| Offset | Size | Type | Field |
+| ---: | ---: | --- | --- |
+| 0 | 2 | uint16 | entity number |
+| 2 | 2 | uint16 | `inlineModel`, N from `*N` |
+| 4 | 1 | uint8 | flags |
+| 5 | 1 | uint8 | `eType` (`currentState.eType`, low 8 bits) |
+| 6 | 2 | uint16 | reserved, 0 |
+| 8 | 12 | float[3] | `lerpOrigin` |
+| 20 | 12 | float[3] | `lerpAngles` |
+| 32 | 12 | float[3] | `pos.trDelta` |
+
+Flags:
+
+| Bit | Mask | Meaning |
+| ---: | --- | --- |
+| 0 | `0x01` | newly seen this frame, or `EF_TELEPORT_BIT` flipped |
+| 1 | `0x02` | moving: `pos.trType` or `apos.trType` is not `TR_STATIONARY` |
+| 2 | `0x04` | `EF_NODRAW` (the renderer skips the brush) |
 
 Hand matrices use the same `G2API_GetBoltMatrix` call as type 4: the NPC ghoul2 model, `handRBolt` / `handLBolt`, `lerpOrigin` (plus the model-scale Z nudge), and yaw from `renderAngles`. Axis order is the same columns: +X, +Y, +Z, in **+X forward, +Y left, +Z up** world units.
 

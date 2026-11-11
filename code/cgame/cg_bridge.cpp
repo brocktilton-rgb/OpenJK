@@ -47,12 +47,15 @@ static uint32_t		s_sentSaber = 0;
 static uint32_t		s_sentRender = 0;
 static uint32_t		s_sentNpc = 0;
 static uint32_t		s_sentHud = 0;
+static uint32_t		s_sentMover = 0;
 static vmCvar_t		bridge_npc_radius;
 static unsigned char	s_npcWasHere[MAX_GENTITIES];
 static int			s_npcLastFlags[MAX_GENTITIES];
 static unsigned char	s_npcFireCount[MAX_GENTITIES];
 static unsigned char	s_npcFireBits[MAX_GENTITIES];
 static int			s_npcLastFireTime[MAX_GENTITIES];
+static unsigned char	s_moverWasHere[MAX_GENTITIES];
+static int			s_moverLastFlags[MAX_GENTITIES];
 static uint32_t		s_sendDrops = 0;
 static uint32_t		s_sendFails = 0;
 static int			s_lastPoseMs = 0;
@@ -210,6 +213,8 @@ static void Bridge_Send( const uint8_t *packet, int size )
 			s_sentNpc++;
 		} else if ( type == BRIDGE_PACKET_HUD ) {
 			s_sentHud++;
+		} else if ( type == BRIDGE_PACKET_MOVER ) {
+			s_sentMover++;
 		}
 		s_lastSendError[0] = '\0';
 		Bridge_ClearComplain();
@@ -988,6 +993,173 @@ static void Bridge_SendHud( uint32_t frame, int serverTime )
 	Bridge_Send( packet, BRIDGE_HUD_PACKET_SIZE );
 }
 
+// "*N" with N in 1..65535. "*0" is the world model and is not a mover.
+static qboolean Bridge_ParseInlineModel( const char *name, unsigned int *outN )
+{
+	const char *p;
+	unsigned int n = 0;
+
+	if ( !name || name[0] != '*' || !name[1] ) {
+		return qfalse;
+	}
+	for ( p = name + 1; *p; ++p ) {
+		if ( *p < '0' || *p > '9' ) {
+			return qfalse;
+		}
+		n = n * 10u + (unsigned int)( *p - '0' );
+		if ( n > 65535u ) {
+			return qfalse;
+		}
+	}
+	if ( n == 0 ) {
+		return qfalse;
+	}
+	*outN = n;
+	return qtrue;
+}
+
+// SOLID_BMODEL stores the inline index in modelindex (SV_SetBrushModel).
+// CG_Mover draws cgs.inlineDrawModel[modelindex], registered as "*%i".
+// CS_MODELS+modelindex is that "*N" string only when something registered it
+// there. Otherwise the spawn key on the shared gentity is the "*N" that
+// matches a bsp2gltf node. World model 0 is rejected above.
+static qboolean Bridge_MoverModel( int entityNum, unsigned int *outN )
+{
+	centity_t *cent = &cg_entities[entityNum];
+	gentity_t *gent = &g_entities[entityNum];
+	int modelindex;
+	const char *configName;
+
+	if ( cent->currentState.solid != SOLID_BMODEL ) {
+		return qfalse;
+	}
+	modelindex = cent->currentState.modelindex;
+	if ( modelindex > 0 && modelindex < MAX_MODELS ) {
+		configName = CG_ConfigString( CS_MODELS + modelindex );
+		if ( Bridge_ParseInlineModel( configName, outN ) ) {
+			return qtrue;
+		}
+	}
+	if ( gent->inuse && Bridge_ParseInlineModel( gent->model, outN ) ) {
+		return qtrue;
+	}
+	return qfalse;
+}
+
+static uint8_t *Bridge_WriteMover( uint8_t *p, int entityNum, unsigned int inlineModel )
+{
+	centity_t *cent = &cg_entities[entityNum];
+	unsigned int flags = 0;
+	uint8_t *start = p;
+	int eType = cent->currentState.eType;
+
+	if ( !s_moverWasHere[entityNum] || ( ( cent->currentState.eFlags ^ s_moverLastFlags[entityNum] ) & EF_TELEPORT_BIT ) ) {
+		flags |= BRIDGE_MOVER_NEW;
+	}
+	if ( cent->currentState.pos.trType != TR_STATIONARY || cent->currentState.apos.trType != TR_STATIONARY ) {
+		flags |= BRIDGE_MOVER_MOVING;
+	}
+	if ( cent->currentState.eFlags & EF_NODRAW ) {
+		flags |= BRIDGE_MOVER_NODRAW;
+	}
+	if ( eType < 0 ) {
+		eType = 0;
+	}
+
+	p = Bridge_WriteU16( p, (unsigned int)entityNum );
+	p = Bridge_WriteU16( p, inlineModel );
+	p = Bridge_WriteU8( p, flags );
+	p = Bridge_WriteU8( p, (unsigned int)eType & 0xffu );
+	p = Bridge_WriteU16( p, 0 );
+	p = Bridge_WriteVec3( p, cent->lerpOrigin );
+	p = Bridge_WriteVec3( p, cent->lerpAngles );
+	p = Bridge_WriteVec3( p, cent->currentState.pos.trDelta );
+	if ( (int)( p - start ) != BRIDGE_MOVER_ENTRY_SIZE ) {
+		return start;
+	}
+	return p;
+}
+
+static void Bridge_SendMovers( uint32_t frame, int serverTime )
+{
+	int ids[MAX_GENTITIES];
+	unsigned int models[MAX_GENTITIES];
+	unsigned char here[MAX_GENTITIES];
+	int total = 0;
+	int i;
+	int packetCount;
+	int packetIndex;
+	uint32_t seq;
+
+	static_assert( BRIDGE_MOVER_ENTRY_SIZE == 44, "mover entry size" );
+	static_assert( BRIDGE_MOVER_PACKET_MAX == 1084, "mover packet max" );
+	static_assert( BRIDGE_HEADER_SIZE + 8 + BRIDGE_MOVER_ENTRY_SIZE * BRIDGE_MOVER_MAX_PER_PACKET == BRIDGE_MOVER_PACKET_MAX, "mover packet math" );
+
+	if ( !cg.snap ) {
+		return;
+	}
+	memset( here, 0, sizeof( here ) );
+
+	for ( i = 0; i < cg.snap->numEntities; ++i ) {
+		int num = cg.snap->entities[i].number;
+		unsigned int inlineModel = 0;
+
+		if ( num < 0 || num >= MAX_GENTITIES ) {
+			continue;
+		}
+		if ( !Bridge_MoverModel( num, &inlineModel ) ) {
+			continue;
+		}
+		ids[total] = num;
+		models[total] = inlineModel;
+		total++;
+		here[num] = 1;
+	}
+
+	packetCount = total > 0 ? ( total + BRIDGE_MOVER_MAX_PER_PACKET - 1 ) / BRIDGE_MOVER_MAX_PER_PACKET : 1;
+	seq = s_sequence++;
+	for ( packetIndex = 0; packetIndex < packetCount; ++packetIndex ) {
+		uint8_t packet[BRIDGE_MOVER_PACKET_MAX];
+		uint8_t *p;
+		int begin = packetIndex * BRIDGE_MOVER_MAX_PER_PACKET;
+		int count = total - begin;
+		int n;
+
+		if ( count > BRIDGE_MOVER_MAX_PER_PACKET ) {
+			count = BRIDGE_MOVER_MAX_PER_PACKET;
+		}
+		if ( count < 0 ) {
+			count = 0;
+		}
+		memset( packet, 0, sizeof( packet ) );
+		p = Bridge_WriteHeader( packet, BRIDGE_PACKET_MOVER, seq, frame, serverTime );
+		p = Bridge_WriteU16( p, (unsigned int)count );
+		p = Bridge_WriteU16( p, (unsigned int)total );
+		p = Bridge_WriteU8( p, (unsigned int)packetIndex );
+		p = Bridge_WriteU8( p, (unsigned int)packetCount );
+		p = Bridge_WriteU16( p, 0 );
+		for ( n = 0; n < count; ++n ) {
+			uint8_t *next = Bridge_WriteMover( p, ids[begin + n], models[begin + n] );
+			if ( next == p ) {
+				Bridge_Complain( "mover entry size mismatch" );
+				return;
+			}
+			p = next;
+		}
+		if ( (int)( p - packet ) != BRIDGE_HEADER_SIZE + 8 + count * BRIDGE_MOVER_ENTRY_SIZE ) {
+			Bridge_Complain( "mover packet size mismatch" );
+			return;
+		}
+		Bridge_Send( packet, (int)( p - packet ) );
+	}
+
+	for ( i = 0; i < total; ++i ) {
+		int num = ids[i];
+		s_moverLastFlags[num] = cg_entities[num].currentState.eFlags;
+	}
+	memcpy( s_moverWasHere, here, sizeof( s_moverWasHere ) );
+}
+
 void Bridge_Init( void )
 {
 	if ( s_inited ) {
@@ -1029,8 +1201,8 @@ qboolean Bridge_ConsoleCommand( void )
 	CG_Printf( "  streaming: %s\n", s_streaming ? "yes" : "no" );
 	CG_Printf( "  target: %s:%d\n", bridge_host.string, bridge_port.integer );
 	CG_Printf( "  rate: %d%s\n", rate, rate ? "" : " (every frame)" );
-	CG_Printf( "  packets sent: pose %u, map %u, saber %u, render %u, npc %u, hud %u (dropped %u, failed %u)\n",
-		s_sentPose, s_sentMap, s_sentSaber, s_sentRender, s_sentNpc, s_sentHud, s_sendDrops, s_sendFails );
+	CG_Printf( "  packets sent: pose %u, map %u, saber %u, render %u, npc %u, hud %u, mover %u (dropped %u, failed %u)\n",
+		s_sentPose, s_sentMap, s_sentSaber, s_sentRender, s_sentNpc, s_sentHud, s_sentMover, s_sendDrops, s_sendFails );
 	CG_Printf( "  last send error: %s\n", s_lastSendError[0] ? s_lastSendError : "none" );
 	if ( !s_streaming && s_lastComplain[0] ) {
 		CG_Printf( "  not streaming: %s\n", s_lastComplain );
@@ -1054,6 +1226,8 @@ void Bridge_Shutdown( void )
 	memset( s_npcFireCount, 0, sizeof( s_npcFireCount ) );
 	memset( s_npcFireBits, 0, sizeof( s_npcFireBits ) );
 	memset( s_npcLastFireTime, 0, sizeof( s_npcLastFireTime ) );
+	memset( s_moverWasHere, 0, sizeof( s_moverWasHere ) );
+	memset( s_moverLastFlags, 0, sizeof( s_moverLastFlags ) );
 }
 
 void Bridge_NoteEntityEvent( int entityNum, int event )
@@ -1156,4 +1330,5 @@ void Bridge_Frame( int stereoView )
 	Bridge_SendRender( &cg.predicted_player_state, &cg_entities[0], (uint32_t)cg.clientFrame, cg.time );
 	Bridge_SendNpcs( (uint32_t)cg.clientFrame, cg.time );
 	Bridge_SendHud( (uint32_t)cg.clientFrame, cg.time );
+	Bridge_SendMovers( (uint32_t)cg.clientFrame, cg.time );
 }

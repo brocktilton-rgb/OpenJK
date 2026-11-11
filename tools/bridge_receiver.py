@@ -25,6 +25,7 @@ PACKET_SABER = 3
 PACKET_RENDER = 4
 PACKET_NPC = 5
 PACKET_HUD = 6
+PACKET_MOVER = 7
 POSE_SIZE = 160
 MAP_SIZE = 84
 SABER_SIZE = 672
@@ -34,6 +35,12 @@ NPC_ENTRY_SIZE_V2 = 248
 NPC_MAX_PER_PACKET = 10
 NPC_MAX_PER_PACKET_V2 = 5
 HUD_SIZE = 56
+MOVER_ENTRY_SIZE = 44
+MOVER_MAX_PER_PACKET = 24
+MOVER_PACKET_MAX = 28 + MOVER_ENTRY_SIZE * MOVER_MAX_PER_PACKET
+MOVER_NEW = 0x01
+MOVER_MOVING = 0x02
+MOVER_NODRAW = 0x04
 MAP_NAME_LEN = 64
 HILT_NAME_LEN = 64
 SABER_BLADE_SLOTS = 16
@@ -237,6 +244,30 @@ def decode_packet(buf: bytes) -> dict:
         values = struct.unpack_from("<9i", buf, 20)
         header.update(zip(names, values))
         return header
+    if kind == PACKET_MOVER:
+        if len(buf) < 28:
+            raise PacketError("short mover packet (%d)" % len(buf))
+        count = _u16(buf, 20)
+        if count > MOVER_MAX_PER_PACKET or len(buf) < 28 + count * MOVER_ENTRY_SIZE:
+            raise PacketError("bad mover packet count %d (%d bytes)" % (count, len(buf)))
+        header["mover_count"] = count
+        header["mover_total"] = _u16(buf, 22)
+        header["mover_index"] = buf[24]
+        header["mover_packets"] = buf[25]
+        movers = []
+        for index in range(count):
+            off = 28 + index * MOVER_ENTRY_SIZE
+            movers.append({
+                "entity": _u16(buf, off),
+                "inline_model": _u16(buf, off + 2),
+                "flags": buf[off + 4],
+                "etype": buf[off + 5],
+                "origin": _vec3(buf, off + 8),
+                "angles": _vec3(buf, off + 20),
+                "velocity": _vec3(buf, off + 32),
+            })
+        header["movers"] = movers
+        return header
     header["skipped"] = True
     return header
 
@@ -380,6 +411,40 @@ def format_packet(packet: dict, verbose: bool) -> str:
             lines.append(
                 "  ent=%d %s %s hp=%d weap=%d org=%s"
                 % (npc["entity"], npc["npc_type"] or '""', state, npc["health"], npc["weapon"], _fmt_vec(npc["origin"]))
+            )
+        return "\n".join(lines)
+    if packet["type"] == PACKET_MOVER:
+        lines = [
+            "mover seq=%d frame=%d t=%d part=%d/%d count=%d total=%d"
+            % (
+                packet["sequence"],
+                packet["frame"],
+                packet["server_time"],
+                packet["mover_index"] + 1,
+                packet["mover_packets"],
+                packet["mover_count"],
+                packet["mover_total"],
+            )
+        ]
+        for mover in packet["movers"]:
+            bits = []
+            if mover["flags"] & MOVER_NEW:
+                bits.append("new")
+            if mover["flags"] & MOVER_MOVING:
+                bits.append("moving")
+            if mover["flags"] & MOVER_NODRAW:
+                bits.append("nodraw")
+            lines.append(
+                "  ent=%d *%d %s etype=%d org=%s ang=%s vel=%s"
+                % (
+                    mover["entity"],
+                    mover["inline_model"],
+                    ",".join(bits) or "-",
+                    mover["etype"],
+                    _fmt_vec(mover["origin"]),
+                    _fmt_vec(mover["angles"]),
+                    _fmt_vec(mover["velocity"]),
+                )
             )
         return "\n".join(lines)
     if packet["type"] == PACKET_HUD:
@@ -639,6 +704,25 @@ def self_test() -> int:
     assert hud["health"] == 80 and hud["max_health"] == 100 and hud["armor"] == 25
     assert hud["force"] == 50 and hud["force_max"] == 100
     assert hud["weapon"] == 6 and hud["ammo"] == 30 and hud["ammo_max"] == 300
+
+    mover_buf = bytearray(28 + MOVER_ENTRY_SIZE)
+    struct.pack_into("<4sHHIIi", mover_buf, 0, MAGIC, VERSION, PACKET_MOVER, 14, 42, 1900)
+    struct.pack_into("<HHBBH", mover_buf, 20, 1, 3, 0, 2, 0)
+    struct.pack_into("<HHBBH", mover_buf, 28, 40, 7, MOVER_NEW | MOVER_MOVING, 4, 0)
+    struct.pack_into("<3f3f3f", mover_buf, 36, 64.0, 0.0, 8.0, 0.0, 90.0, 0.0, 100.0, 0.0, 0.0)
+    assert len(mover_buf) == 72
+    assert MOVER_PACKET_MAX == 1084
+    mover = decode_packet(bytes(mover_buf))
+    assert mover["version"] == 1
+    assert mover["mover_count"] == 1 and mover["mover_total"] == 3
+    assert mover["mover_index"] == 0 and mover["mover_packets"] == 2
+    assert mover["movers"][0]["entity"] == 40
+    assert mover["movers"][0]["inline_model"] == 7
+    assert mover["movers"][0]["flags"] == (MOVER_NEW | MOVER_MOVING)
+    assert mover["movers"][0]["etype"] == 4
+    assert mover["movers"][0]["origin"] == (64.0, 0.0, 8.0)
+    assert mover["movers"][0]["angles"] == (0.0, 90.0, 0.0)
+    assert mover["movers"][0]["velocity"] == (100.0, 0.0, 0.0)
     # Type 1 and type 2 still decode after a type 3 packet, and unknown types are skipped.
     assert decode_packet(_pack_pose())["type"] == PACKET_POSE
     unknown = bytearray(24)
@@ -676,8 +760,8 @@ def self_test() -> int:
         sock.close()
 
     print(
-        "bridge_receiver self-test ok (pose %d, map %d, saber %d, render %d bytes)"
-        % (POSE_SIZE, MAP_SIZE, SABER_SIZE, RENDER_SIZE)
+        "bridge_receiver self-test ok (pose %d, map %d, saber %d, render %d, mover entry %d bytes)"
+        % (POSE_SIZE, MAP_SIZE, SABER_SIZE, RENDER_SIZE, MOVER_ENTRY_SIZE)
     )
     return 0
 
@@ -708,6 +792,7 @@ def listen(host: str, port: int, verbose: bool, summary: bool) -> int:
     sabers = 0
     renders = 0
     skipped = 0
+    movers = 0
     last_pose = None
 
     try:
@@ -738,6 +823,8 @@ def listen(host: str, port: int, verbose: bool, summary: bool) -> int:
                     sabers += 1
                 elif packet["type"] == PACKET_RENDER:
                     renders += 1
+                elif packet["type"] == PACKET_MOVER:
+                    movers += 1
                 if not summary:
                     suffix = "" if missed == 0 else "  gap=%d" % missed
                     print(format_packet(packet, verbose) + suffix, flush=True)
@@ -749,8 +836,8 @@ def listen(host: str, port: int, verbose: bool, summary: bool) -> int:
             if elapsed >= 1.0:
                 rate = window_count / elapsed
                 print(
-                    "rate %.1f pkt/s  window=%d total=%d pose=%d map=%d saber=%d render=%d skip=%d bad=%d seq_gaps=%d"
-                    % (rate, window_count, total, poses, maps, sabers, renders, skipped, bad, tracker.gaps),
+                    "rate %.1f pkt/s  window=%d total=%d pose=%d map=%d saber=%d render=%d mover=%d skip=%d bad=%d seq_gaps=%d"
+                    % (rate, window_count, total, poses, maps, sabers, renders, movers, skipped, bad, tracker.gaps),
                     flush=True,
                 )
                 if summary and last_pose is not None:
@@ -759,8 +846,8 @@ def listen(host: str, port: int, verbose: bool, summary: bool) -> int:
                 window_count = 0
     except KeyboardInterrupt:
         print(
-            "\nstopped. total=%d pose=%d map=%d saber=%d render=%d skip=%d bad=%d seq_gaps=%d"
-            % (total, poses, maps, sabers, renders, skipped, bad, tracker.gaps)
+            "\nstopped. total=%d pose=%d map=%d saber=%d render=%d mover=%d skip=%d bad=%d seq_gaps=%d"
+            % (total, poses, maps, sabers, renders, movers, skipped, bad, tracker.gaps)
         )
         return 0
     finally:

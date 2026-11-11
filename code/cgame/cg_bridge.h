@@ -34,6 +34,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #define BRIDGE_PACKET_RENDER		4
 #define BRIDGE_PACKET_NPC			5
 #define BRIDGE_PACKET_HUD			6
+#define BRIDGE_PACKET_MOVER			7
 
 // Common header is 20 bytes. Sizes include that header.
 // Type 1 and type 2 layouts are frozen. New packets use a new type.
@@ -81,6 +82,15 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #define BRIDGE_NPC_DEAD				2
 
 #define BRIDGE_HUD_PACKET_SIZE		56
+
+// Type 7. Same 20-byte header (version 1) and 8-byte body header as type 5.
+// 24 entries: 28 + 24*44 = 1084.
+#define BRIDGE_MOVER_ENTRY_SIZE		44
+#define BRIDGE_MOVER_MAX_PER_PACKET	24
+#define BRIDGE_MOVER_PACKET_MAX		1084
+#define BRIDGE_MOVER_NEW			0x01u
+#define BRIDGE_MOVER_MOVING			0x02u
+#define BRIDGE_MOVER_NODRAW			0x04u
 
 #define BRIDGE_DEFAULT_PORT			"27420"
 
